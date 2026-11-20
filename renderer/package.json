@@ -1,0 +1,13 @@
+{
+  "name": "nowa-sea-renderer",
+  "private": true,
+  "description": "WebGPU renderer of the NOWA Sea aquarium, a hard fork of abyssal-garden (MIT), bundled into one HTML file",
+  "type": "module",
+  "scripts": {
+    "build": "node build.mjs",
+    "build:readable": "node build.mjs --readable"
+  },
+  "devDependencies": {
+    "esbuild": "0.28.2"
+  }
+}

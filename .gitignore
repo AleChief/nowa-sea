@@ -1,0 +1,18 @@
+# Third-party code fetched by scripts/setup (PolyForm Strict: must not be redistributed)
+/vendor/
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Node / renderer build
+node_modules/
+/renderer/dist/
+
+# Runtime data
+/saves/
+/logs/
+/tmp/
+*.log

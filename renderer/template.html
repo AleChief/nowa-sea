@@ -1,0 +1,141 @@
+<!doctype html>
+<html lang=en>
+<head>
+<meta charset=utf-8>
+<title>NOWA Sea</title>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<meta name=theme-color content=#05090d>
+<style>
+/* The class on <body> is the state of the page:
+   l = loading the world, g = in the scene (g p while the mouse is captured), l e = failed to start */
+html { background: #05090d; }
+body {
+  position: fixed; top: 0; left: 0; width: 100%; height: 100%; margin: 0; overflow: hidden;
+  background: #05090d; font: 600 13px/1.4 system-ui, sans-serif; color: #e8fbff;
+  -webkit-user-select: none; user-select: none;
+}
+#c { position: absolute; width: 100%; height: 100%; touch-action: none; cursor: grab; }
+#c.drag { cursor: grabbing; }
+.p #c { cursor: none; }
+
+/* HUD (src/hud.js): an overlay over the canvas; only its panels take the mouse */
+#hud { position: absolute; inset: 0; pointer-events: none; font: 500 12px/1.35 system-ui, sans-serif; color: #dff6fb; }
+#hud > * { pointer-events: auto; }
+.l #hud { display: none; }
+#hud button, #hud select, #hud input { font: inherit; color: inherit; }
+#hud button { padding: .25em .6em; border: 0; border-radius: .35em; background: #ffffff18; cursor: pointer; white-space: nowrap; }
+#hud button:hover { background: #ffffff30; }
+#hud button.on { background: #7ff3ff; color: #03222d; font-weight: 700; }
+#hud button.arm { background: #ffb36b; color: #2a1300; font-weight: 700; }
+#hud select, #hud input[type=text], #hud input[type=number] { padding: .2em .4em; border: 1px solid #7ff3ff40; border-radius: .35em; background: #03131c; }
+.hpan { background: #03131cc4; border: 1px solid #7ff3ff26; border-radius: .6em; box-shadow: 0 .3em 1.2em #0008; }
+#hbar { position: absolute; top: .5em; left: 50%; transform: translateX(-50%); display: flex; flex-wrap: wrap; justify-content: center; align-items: center; gap: .35em .8em; padding: .35em .6em; max-width: calc(100% - 1em); }
+#hbar .g { display: flex; align-items: center; gap: .25em; }
+#hclk { font-weight: 700; min-width: 9em; }
+#hclk i { font-style: normal; margin-right: .3em; }
+#hach { min-width: 4.5em; color: #9fe9a8; }
+#hach.warn { color: #ffb36b; }
+#hpop { position: absolute; top: 4.2em; left: .6em; width: 17.5em; padding: .5em .6em; }
+#hpop h3, #hins h3 { margin: 0; font-size: 1.05em; display: flex; justify-content: space-between; align-items: center; cursor: pointer; }
+#hpop.min .body { display: none; }
+#hpop .row { display: grid; grid-template-columns: 1em 1fr auto auto; gap: .45em; align-items: center; margin-top: .3em; }
+#hpop .chip { width: .9em; height: .9em; border-radius: 50%; }
+#hpop .ext { grid-column: 2 / 5; color: #ffb36b; font-size: .92em; margin-top: -.15em; }
+#hpop .cnt { font-variant-numeric: tabular-nums; font-weight: 700; }
+#hpop .gen { color: #9fcbd5; font-size: .9em; }
+#hpop canvas { width: 100%; height: 70px; margin-top: .5em; display: block; }
+#hpop .foot { margin-top: .35em; color: #a9cdd6; font-size: .92em; }
+#hins { position: absolute; top: 4.2em; right: .6em; width: 18.5em; padding: .5em .6em; display: none; max-height: calc(100% - 6em); overflow: auto; }
+#hins.show { display: block; }
+#hins .sub { color: #9fcbd5; margin: .15em 0 .35em; }
+#hins .kv { display: grid; grid-template-columns: 6.5em 1fr; gap: .2em .5em; align-items: center; }
+#hins .bar { position: relative; height: .55em; border-radius: .3em; background: #ffffff14; overflow: hidden; }
+#hins .bar i { position: absolute; top: 0; bottom: 0; left: 0; background: #7ff3ff; border-radius: .3em; }
+#hins .bar.c::after { content: ''; position: absolute; left: 50%; top: 0; bottom: 0; width: 1px; background: #ffffff50; }
+#hins .sec { margin-top: .5em; color: #7ff3ff; font-weight: 700; font-size: .92em; text-transform: uppercase; letter-spacing: .06em; }
+#hins .tags span, #hins .toks span { display: inline-block; margin: .15em .25em 0 0; padding: .05em .45em; border-radius: .8em; background: #ffffff16; font-size: .92em; }
+#hins .tags span.w { background: #ffb36b; color: #2a1300; }
+#hins .x { padding: 0 .45em; }
+#hlog { position: absolute; right: .6em; bottom: .6em; width: 19em; display: flex; flex-direction: column; gap: .25em; pointer-events: none; }
+#hlog div { padding: .25em .5em; border-radius: .4em; background: #03131cb0; transition: opacity 1s; }
+#hlog b { font-weight: 700; }
+#htoast { position: absolute; top: 4.4em; left: 50%; transform: translateX(-50%); display: flex; flex-direction: column; align-items: center; gap: .3em; pointer-events: none; }
+#htoast div { padding: .4em .9em; border-radius: .5em; background: #0b3a4df0; box-shadow: 0 .3em 1em #0009; transition: opacity .6s; }
+#htoast div.err { background: #6b1f1ff0; }
+#hhint { position: absolute; top: 4.4em; left: 50%; transform: translateX(-50%); padding: .4em .9em; border-radius: .5em; background: #ffb36be8; color: #2a1300; font-weight: 700; display: none; pointer-events: none; }
+#hturbo { position: absolute; left: 50%; top: 42%; transform: translate(-50%, -50%); padding: .3em 1em; border-radius: .3em; font: 900 3.2em/1.2 system-ui, sans-serif; letter-spacing: .12em; color: #ffb36b; background: #03131c9c; text-shadow: 0 0 .5em #ff8a00; display: none; pointer-events: none; text-align: center; }
+#hturbo small { display: block; font-size: .32em; letter-spacing: .05em; color: #ffe1c2; }
+#hov { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+#hmod { position: absolute; inset: 0; display: none; place-items: center; background: #0008; }
+#hmod.show { display: grid; }
+#hmod .box { width: min(46em, calc(100% - 2em)); max-height: calc(100% - 3em); overflow: auto; padding: .8em 1em 1em; }
+#hmod h2 { margin: 0 0 .5em; font-size: 1.2em; display: flex; justify-content: space-between; align-items: center; }
+#hmod .cols { display: grid; grid-template-columns: 1.4fr 1fr; gap: 1.2em; }
+#hmod h4 { margin: .6em 0 .35em; color: #7ff3ff; font-size: .95em; text-transform: uppercase; letter-spacing: .06em; }
+#hmod .line { display: flex; flex-wrap: wrap; align-items: center; gap: .4em; margin: .3em 0; }
+#hmod table { width: 100%; border-collapse: collapse; }
+#hmod td { padding: .25em .3em; border-top: 1px solid #ffffff14; vertical-align: middle; }
+#hmod td.n { font-weight: 700; word-break: break-all; }
+#hmod td.m { color: #9fcbd5; font-size: .92em; }
+#hmod td.b { white-space: nowrap; text-align: right; }
+#hmod a { color: #7ff3ff; }
+#hmod .fbtn { padding: .25em .6em; border-radius: .35em; background: #ffffff18; cursor: pointer; white-space: nowrap; }
+#hmod .fbtn:hover { background: #ffffff30; }
+#hmod .st { color: #9fe9a8; min-height: 1.3em; }
+#hmod .st.err { color: #ff9b8a; }
+@media (max-width: 52em) { #hmod .cols { grid-template-columns: 1fr; } #hpop { width: 15em; } #hins { width: 16em; } }
+.tool #c { cursor: crosshair; }
+
+/* loading screen */
+#m {
+  position: absolute; inset: 0; display: grid; place-content: center; justify-items: center; gap: 1.2em;
+  text-align: center; background: radial-gradient(#0b2a38, #05090d 70%); transition: opacity .8s, visibility .8s;
+}
+.g #m { opacity: 0; visibility: hidden; }
+h1 {
+  margin: 0; font: 900 4em/1 system-ui, sans-serif; letter-spacing: .06em; text-transform: uppercase;
+  color: #0000; background: linear-gradient(#fff 25%, #7ff3ff 60%, #14a9c4);
+  -webkit-background-clip: text; background-clip: text; filter: drop-shadow(0 .06em .2em #000c);
+}
+#p { width: 22em; height: .45em; overflow: hidden; border-radius: 1em; background: #03131c; box-shadow: 0 0 0 2px #7ff3ff80, 0 0 1.5em #14a9c4; }
+#b { display: block; height: 100%; background: linear-gradient(90deg, #14a9c4, #9ff6ff); transform: scaleX(0); transform-origin: 0; will-change: transform; }
+#s { margin: 0; font-size: .95em; letter-spacing: .12em; text-transform: uppercase; color: #9fdbe8; }
+.e #p { visibility: hidden; }
+.e #s { font-size: 1.1em; letter-spacing: 0; text-transform: none; color: #fff; }
+
+/* key legend, bottom left; the current camera mode is lit */
+#k {
+  position: absolute; left: .8em; bottom: .8em; max-width: calc(100% - 1.6em); padding: .5em .7em; border-radius: .5em;
+  background: #03131ca8; font: 500 11px/1.55 system-ui, sans-serif; color: #cfeef5; pointer-events: auto;
+}
+.l #k { display: none; }
+#k b { display: inline-block; min-width: 1em; padding: 0 .35em; margin-right: .15em; border-radius: .3em; background: #e8fbff; color: #03222d; text-align: center; font-weight: 700; }
+#k .on { color: #7ff3ff; font-weight: 700; }
+#k .q { margin-left: .2em; padding: 0 .4em; border: 0; border-radius: .3em; background: #ffffff1f; color: #cfeef5; font: inherit; cursor: pointer; }
+#k .q.on { background: #7ff3ff; color: #03222d; }
+
+/* crosshair while the mouse is captured */
+#x { position: absolute; left: 50%; top: 50%; width: 14px; height: 14px; margin: -7px 0 0 -7px; border: 1.5px solid #ffffffb0; border-radius: 50%; display: none; pointer-events: none; }
+.p #x { display: block; }
+/* stats line (H) and connection notice */
+#i { position: absolute; top: .8em; left: 1em; margin: 0; font: 12px/1.6 ui-monospace, Consolas, monospace; white-space: pre-wrap; text-shadow: 0 1px 4px #000; pointer-events: none; }
+#n { position: absolute; top: .8em; right: 1em; padding: .3em .7em; border-radius: .4em; background: #5a1d1dd0; display: none; pointer-events: none; }
+</style>
+</head>
+<body class=l>
+<canvas id=c></canvas>
+<div id=hud></div>
+<div id=m>
+  <h1>NOWA Sea</h1>
+  <div id=p><i id=b></i></div>
+  <p id=s>Connecting…</p>
+</div>
+<div id=k></div>
+<div id=x></div>
+<pre id=i></pre>
+<div id=n></div>
+<script>
+/*SCRIPT*/
+</script>
+</body>
+</html>

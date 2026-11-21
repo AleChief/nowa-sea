@@ -1105,13 +1105,13 @@ class Simulation:
                 continue
             if np.linalg.norm(self.pos[a] - self.pos[b]) > 2.0 + s.radius * 2:
                 continue
-            n, cap = self.count(s.id), self.cap(s)
-            if n >= cap or (s.brain == "nowa" and self.nowa_count() >= self.max_nowa()):
+            full, crowd = self._crowding(s)
+            if full or (s.brain == "nowa" and self.nowa_count() >= self.max_nowa()):
                 continue
             if INTENTS[self.intent[a]] in ("flee", "strike", "chase") or INTENTS[self.intent[b]] in ("flee", "strike"):
                 continue
             # Logistic fecundity: crowding near the ceiling suppresses breeding before food runs out.
-            if self.prng.random() < (n / cap) ** 2:
+            if self.prng.random() < crowd ** 2:
                 self.cooldown[a] = self.cooldown[b] = 0.05 * DAY_S
                 continue
             # Predators breed only when their prey base can carry another mouth.
@@ -1119,6 +1119,18 @@ class Simulation:
                 self.cooldown[a] = self.cooldown[b] = 0.1 * DAY_S
                 continue
             self._make_child(int(a), b)
+
+    ELDER_FRACTION = 0.8   # past this share of its lifespan an individual no longer counts toward crowding
+
+    def _crowding(self, s: Species):
+        """(no room at all, crowding fraction for logistic fecundity). Elders give way: individuals in the last fifth
+        of their life do not count, so a cohort that filled the ceiling together is replaced before it dies of old
+        age together (shades went extinct that way). The hard ceiling gets a quarter more for those elders."""
+        cap = self.cap(s)
+        mine = self.alive & (self.sp == s.index)
+        n = int(mine.sum())
+        young = int((mine & (self.age < self.ELDER_FRACTION * self.lifespan)).sum())
+        return young >= cap or n >= cap + max(1, cap // 4), young / cap
 
     PREY_PER_PREDATOR = {"needlejaw": 2.5, "shade": 2.5}
 

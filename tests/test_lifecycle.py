@@ -49,3 +49,21 @@ def test_waking_starts_a_fresh_decision_interval():
     assert not sim.sleeping[slot]
     assert sim.last_decide[slot] == sim.time
     assert sim.reward[slot] == 0.0
+
+
+def test_elders_give_way_to_a_new_generation():
+    """A cohort that filled the ceiling together must still be able to breed once it grows old; otherwise it dies
+    of old age together and the species goes extinct (shades did)."""
+    pool = BrainPool(kind="stub", workers=0)
+    sim = Simulation(SimConfig(brain_kind="stub", scale=1.0), pool)
+    s = BY_ID["shade"]
+    cap = sim.cap(s)
+    while sim.count("shade") < cap:
+        sim.spawn("shade")
+    shades = [k for k in sim.slot_of.values() if sim.sp[k] == s.index]
+    full, crowd = sim._crowding(s)
+    assert full and crowd == 1.0                       # young cohort at the ceiling: no room
+    for k in shades:
+        sim.age[k] = 0.9 * sim.lifespan[k]             # the whole cohort is old now
+    full, crowd = sim._crowding(s)
+    assert not full and crowd == 0.0                   # elders give way: breeding is possible again

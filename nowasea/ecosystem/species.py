@@ -74,6 +74,7 @@ SPECIES: List[Species] = [
         actions=["scavenge", "burrow", "flee", "rest", "explore", "mate"],
         features=["threat", "food", "cover", "energy", "stamina", "light", "edge", "mate"],
         diet={"detritus": 1.0, "carcass": 1.0, "pellet": 0.6}, metabolism=0.0012, breed_energy=0.7, founders=3,
+        litter=2,
         body_content=0.45, mesh="manta", color=(0.62, 0.52, 0.66), glow=(0.30, 0.95, 0.90), prefers_bottom=True,
     ),
     Species(
@@ -93,8 +94,8 @@ SPECIES: List[Species] = [
         actions=["patrol", "chase", "strike", "rest", "explore", "mate"],
         features=["prey", "energy", "stamina", "light", "edge", "mate"],
         diet={"needlejaw": 1.0, "sweeper": 0.35, "sparkfin": 0.2}, metabolism=0.00025, burst_cost=0.15,
-        hungry_below=0.55,
-        breed_energy=0.8, founders=2, litter=2,
+        hungry_below=0.6,
+        breed_energy=0.7, founders=2, litter=2,
         body_content=0.8, mesh="shark", color=(0.22, 0.27, 0.32), glow=(0.35, 0.70, 1.00),
     ),
     Species(

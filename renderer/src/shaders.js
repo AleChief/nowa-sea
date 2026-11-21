@@ -549,11 +549,13 @@ const W_CRE = S_B + /*wgsl*/`
 override MESH: u32 = 0u;
 struct VI { @location(0) p: vec3f, @location(1) n: vec4f, @location(2) a: vec4f, @location(3) b: vec4f, @location(4) c: vec4f, @location(5) d: vec4f, @location(6) e: vec4f, @location(7) f: vec4f };
 struct VO { @builtin(position) cp: vec4f, @location(0) wp: vec3f, @location(1) n: vec3f, @location(2) op: vec3f,
-  @location(3) @interpolate(flat) s: vec4f, @location(4) @interpolate(flat) x: vec4f, @location(5) lt: f32, @location(6) ax: f32 };
+  @location(3) @interpolate(flat) s: vec4f, @location(4) @interpolate(flat) x: vec4f, @location(5) lt: f32, @location(6) ax: f32,
+  @location(7) @interpolate(flat) h: vec4f };
 @vertex fn vs(i: VI) -> VO {
   var o: VO;
   let F = i.b.xyz; let U = i.c.xyz; let S = cross(F, U);
-  let ph = i.b.w * TAU; let sz = i.a.w * (.2 + .8 * i.d.w);
+  // highlight life: far creatures drawn up to 1.4x larger so a few pixels still read as a fish
+  let ph = i.b.w * TAU; let sz = i.a.w * (.2 + .8 * i.d.w) * (1. + g.mis.w * .4 * ss(25., 90., distance(i.a.xyz, g.cam.xyz)));
   var l = i.p; var n = i.n.xyz; let ax = i.n.w;
   let spd = sat(i.e.y);
   // eating: a short bite pulse every ~0.7 s
@@ -597,10 +599,32 @@ struct VO { @builtin(position) cp: vec4f, @location(0) wp: vec3f, @location(1) n
     l.x += bite * .035 * sat((l.x - .15) * 4.);
   }
   if (MESH == 1u) { l.y -= bite * .02; }
-  let w = i.a.xyz + (F * l.x + U * l.y + S * l.z) * sz;
-  o.cp = g.vp * vec4f(w, 1.); o.wp = w; o.n = F * n.x + U * n.y + S * n.z; o.op = i.p;
+  var w = i.a.xyz + (F * l.x + U * l.y + S * l.z) * sz;
+  o.n = F * n.x + U * n.y + S * n.z;
+  o.cp = g.vp * vec4f(w, 1.); o.wp = w; o.op = i.p;
   o.s = vec4f(i.c.w, i.d.x, i.d.y, i.d.z); o.x = vec4f(i.e.xyz, bite); o.lt = shadow1(w); o.ax = ax;
+  o.h = vec4f(f32(MESH), i.f.z, i.e.w, i.f.w); // body plan, excitement, mode (1 hunting, 2 fleeing), flash
   return o;
+}
+// highlight life: an outline coloured by role, warm against the teal water: prey gold, predators coral red; brighter and
+// whiter with excitement (speed, a flight), a slow red pulse while hunting, a short flash on a catch or a birth. h: body
+// plan (0 sparkfin, 1 sweeper: prey; 2 needlejaw, 3 shade: predators; 4 jelly), excitement 0..1, mode, flash 0..1
+fn hlCol(h: vec4f) -> vec3f {
+  let pred = h.x > 1.5;
+  var c = select(vec3f(1., .7, .2), vec3f(1., .32, .2), pred);
+  if (h.z > 1.5) { c = mix(c, vec3f(1., .93, .72), .6 * h.y); }
+  if (h.z > .5 && h.z < 1.5) { c = vec3f(1., .2, .12) * (.75 + .25 * sin(g.cam.w * 4.)); }
+  return c;
+}
+// calm: no light on the body at all, only the screen-space outline (W_MASK, W_POST); events (excitement, flash) add
+// a thin rim on the body's own edge and a brighter outline, and always show; sleep and cover dim the calm level (gl)
+fn hlCalm(h: vec4f, gl: f32) -> f32 { return g.mis.w * (.55 + .45 * sat(gl)) * select(1., .35, h.x > 3.5); }
+fn hlEv(h: vec4f) -> f32 { return g.mis.w * (h.y + h.w * 1.6) * select(1., .4, h.x > 3.5); }
+fn halo(n: vec3f, wp: vec3f, h: vec4f, gl: f32, z: f32) -> vec3f {
+  if (g.mis.w <= 0.) { return vec3f(0.); }
+  let v = g.cam.xyz - wp; let d = length(v);
+  let r = 1. - sat(abs(dot(n, v / d)));
+  return hlCol(h) * pow(r, 6.) * 1.4 * hlEv(h) * exp(-sg(z).g * wlen(wp) * .2);
 }
 @fragment fn fs(i: VO, @builtin(front_facing) ff: bool) -> @location(0) vec4f {
   var n = normalize(i.n); if (!ff) { n = -n; }
@@ -643,7 +667,7 @@ struct VO { @builtin(position) cp: vec4f, @location(0) wp: vec3f, @location(1) n
   var c = alb * (E * (.25 + .75 * sat(dot(n, L))) + amb(i.wp, n, vv.g, z) * 1.3);
   c += E * pow(sat(dot(n, normalize(V + L))), shp) * sp + vec3f(.3, .6, .7) * pow(1. - sat(dot(n, V)), 3.) * .25 * vv.g * g.env.x;
   c += sel * vec3f(.4, .75, 1.) * pow(1. - sat(dot(n, V)), 4.) * (.5 + .3 * sin(g.cam.w * 4.));
-  return fin(fog(c + em, i.wp, z));
+  return fin(fog(c + em, i.wp, z) + halo(n, i.wp, i.h, i.s.x, z));
 }
 @fragment fn fsJelly(i: VO, @builtin(front_facing) ff: bool) -> @location(0) vec4f {
   var n = normalize(i.n); if (!ff) { n = -n; }
@@ -660,8 +684,19 @@ struct VO { @builtin(position) cp: vec4f, @location(0) wp: vec3f, @location(1) n
   let em = (pow(col, vec3f(1.8)) * bell * (.08 + fr * .32) + gc * (bell * rim * .55 + (1. - bell) * (.22 - .1 * i.ax))) * gi * pul;
   let a = mix(.45 * (1. - .5 * i.ax), .16 + .5 * fr + rim * .3, bell);
   let T = exp(-sg(z).g * wlen(i.wp));
-  let c = (lit * a + em + sel * vec3f(.5, .85, 1.) * fr) * T;
+  let c = (lit * a + em + sel * vec3f(.5, .85, 1.) * fr) * T + halo(n, i.wp, i.h, i.s.x, z);
   return vec4f(min(c, vec3f(20.)), sat(a * T));
+}
+`;
+
+// highlight life, step 1: every visible creature into a mask (role colour; alpha = strength / 4), skipped where the
+// scene in front of it is nearer (rock, kelp), so the outline drawn from it in W_POST never shows through them
+const W_MASK = W_CRE + /*wgsl*/`
+@group(1) @binding(0) var tZm: texture_depth${AA > 1 ? '_multisampled' : ''}_2d;
+@fragment fn fsMask(i: VO) -> @location(0) vec4f {
+  if (textureLoad(tZm, vec2i(i.cp.xy), 0) > i.cp.z * 1.003 + 1e-7) { discard; }
+  let far = 1. + 1.3 * ss(12., 50., distance(i.wp, g.cam.xyz)); // a far fish is a few pixels: a stronger line keeps it readable
+  return vec4f(hlCol(i.h), sat((hlCalm(i.h, i.s.x) * far + hlEv(i.h)) * .25));
 }
 `;
 
@@ -1030,6 +1065,7 @@ const W_POST = S_G + W_FS + /*wgsl*/`
 @group(0) @binding(3) var tR: texture_2d<f32>;
 @group(0) @binding(4) var tB: texture_2d<f32>;
 @group(0) @binding(5) var tDp: texture_depth${AA > 1 ? '_multisampled' : ''}_2d;
+@group(0) @binding(6) var tM: texture_2d<f32>;
 fn tmap(x: vec3f) -> vec3f { return sat3((x * (2.51 * x + .03)) / (x * (2.43 * x + .59) + .14)); }
 fn sat3(x: vec3f) -> vec3f { return clamp(x, vec3f(0.), vec3f(1.)); }
 @fragment fn fs(@builtin(position) fc: vec4f) -> @location(0) vec4f {
@@ -1051,6 +1087,23 @@ fn sat3(x: vec3f) -> vec3f { return clamp(x, vec3f(0.), vec3f(1.)); }
   let bl = textureSampleLevel(tB, sC, uv, 0.).rgb;
   c = mix(c, bl, .06) + bl * .03;
   c *= g.mis.x;
+  // highlight life, step 2: outside a creature's silhouette, a 2 px line in its role colour where the mask is next to
+  // the pixel, and a faint glow from a wider ring; never on the body itself, so it is an outline at any angle
+  if (g.mis.w > 0.) {
+    let m0 = textureLoad(tM, px, 0);
+    if (m0.a <= 0.) {
+      let mxm = vec2i(textureDimensions(tM)) - 1;
+      var line = vec4f(0.); var glow = vec4f(0.);
+      for (var k = 0; k < 8; k++) {
+        let a = f32(k) * .7853982; let dv = vec2f(cos(a), sin(a));
+        let m1 = textureLoad(tM, clamp(px + vec2i(round(dv * 2.)), vec2i(0), mxm), 0);
+        let m2 = textureLoad(tM, clamp(px + vec2i(round(dv * 5.)), vec2i(0), mxm), 0);
+        if (m1.a > line.a) { line = m1; }
+        glow += vec4f(m2.rgb * m2.a, m2.a);
+      }
+      c += line.rgb * min(line.a * 4., 3.) * .55 + glow.rgb * .16;
+    }
+  }
   let q = uv - .5;
   c *= 1. - dot(q, q) * .55;
   c = tmap(c);

@@ -112,6 +112,11 @@ const pLeaf5 = scenePipe(mLeaf, 'vs', 'fs', [ibLeaf], { strip: true, constants: 
 const pLeafS = scenePipe(mLeaf, 'vs', 'fs', [ibLeaf], { strip: true, constants: { ROWS: 3, FAR: 70 } });
 const pLeafF = scenePipe(mLeaf, 'vs', 'fs', [ibLeaf], { strip: true, constants: { ROWS: 3, FAR: 200 } });
 const pCre = [0, 1, 2, 3].map((k) => scenePipe(mCre, 'vs', 'fs', [vbSolid, ibCre], { constants: { MESH: k } }));
+// highlight life: creatures into a mask, depth-tested by hand against the scene (W_MASK)
+const bglM = device.createBindGroupLayout({ entries: [{ binding: 0, visibility: SS.FRAGMENT, texture: { sampleType: 'depth', multisampled: AA > 1 } }] });
+const mMask = mod(W_MASK), plM = device.createPipelineLayout({ bindGroupLayouts: [bgl0, bglM] });
+const pMask = [0, 1, 2, 3, 4].map((k) => device.createRenderPipeline({ layout: plM, vertex: { module: mMask, entryPoint: 'vs', buffers: [vbSolid, ibCre], constants: { MESH: k } },
+  fragment: { module: mMask, entryPoint: 'fsMask', targets: [{ format: 'rgba8unorm' }], constants: { MESH: k } }, primitive: { topology: 'triangle-list' } }));
 const pJelly = scenePipe(mCre, 'vs', 'fsJelly', [vbSolid, ibCre], { constants: { MESH: 4 }, blend: PRE });
 const pSurf = scenePipe(mSurf, 'vs', 'fs', [], { strip: true }), pSurfTop = scenePipe(mSurf, 'vs', 'fsTop', [], { strip: true, blend: PRE });
 const pBack = scenePipe(mSurf, 'vsB', 'fsB', [], { strip: true });
@@ -238,7 +243,7 @@ const PIXMAX = 2560 * 1440, PIXMIN = mob ? 25e4 : 3e5, DETMIN = 0.4;
 let W = 0, H = 0, DW = 0, DH = 0, pix = +SV[1] || (LV > 1 ? 41e4 : mob ? 1280 * 720 : PIXMAX), det = +SV[2] || 1, dynN = 0, dynT = 0, dynG = 0, dynGN = 0, dynBad = 0, dynOk = 0, dynWait = 3;
 let passScene, passRays, passBlur, bgBlur, passPost, bgRays, bgRaysX, bgPost, bloomPass = [], bloomBG = [], targets = [], vDp, vRes, vRay, vRay2, vBl;
 const cpSrc = { texture: null }, cpDst = { texture: null };
-let tCopyT, passGlass, bgGlass, glassSz;
+let tCopyT, passGlass, bgGlass, glassSz, vMask, passMask, bgMask;
 const NB = 6;
 function resize() {
   DW = max(2, round(canvas.clientWidth * devicePixelRatio)); DH = max(2, round(canvas.clientHeight * devicePixelRatio));
@@ -251,7 +256,9 @@ function resize() {
   for (const t of targets) t.destroy();
   const tMS = tex(AA > 1 ? W : 1, H, HDR, TU.RENDER_ATTACHMENT, { samples: AA }), tDp = tex(W, H, DEPTH, TU.RENDER_ATTACHMENT | TU.TEXTURE_BINDING, { samples: AA });
   const tRes = tex(W, H, HDR, TU.RENDER_ATTACHMENT | TU.TEXTURE_BINDING | (GLASS ? TU.COPY_SRC : 0)), tRay = tex(W / 2, H / 2, HDR, TU.RENDER_ATTACHMENT | TU.TEXTURE_BINDING), tRay2 = tex(W / 2, H / 2, HDR, TU.RENDER_ATTACHMENT | TU.TEXTURE_BINDING);
-  targets = [tMS, tDp, tRes, tRay, tRay2];
+  const tMask = tex(W, H, 'rgba8unorm', TU.RENDER_ATTACHMENT | TU.TEXTURE_BINDING);
+  targets = [tMS, tDp, tRes, tRay, tRay2, tMask];
+  vMask = tMask.createView(); passMask = { colorAttachments: [colorAtt(vMask, true)] };
   const bl = [];
   for (let i = 0; i < NB; i++) { const t = tex(max(1, W >> (i + 1)), max(1, H >> (i + 1)), HDR, TU.RENDER_ATTACHMENT | TU.TEXTURE_BINDING); bl.push(t); targets.push(t); }
   vDp = tDp.createView(); vRes = tRes.createView(); vRay = tRay.createView(); vRay2 = tRay2.createView(); vBl = bl.map((t) => t.createView());
@@ -279,7 +286,8 @@ function mkRT() {
   if (GLASS) bgGlass = device.createBindGroup({ layout: bglB, entries: [{ binding: 0, resource: tCopyT.createView() }, { binding: 1, resource: vDp }] });
   bgRays = raysBG(shIdx ? tShadow2 : tShadow); if (MOVE) bgRaysX = raysBG(shIdx ? tShadow : tShadow2);
   bgPost = device.createBindGroup({ layout: pPost.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: ubo } }, { binding: 1, resource: sClamp }, { binding: 2, resource: vRes },
-    { binding: 3, resource: vRay2 }, { binding: 4, resource: vBl[0] }, { binding: 5, resource: vDp }] });
+    { binding: 3, resource: vRay2 }, { binding: 4, resource: vBl[0] }, { binding: 5, resource: vDp }, { binding: 6, resource: vMask }] });
+  bgMask = device.createBindGroup({ layout: bglM, entries: [{ binding: 0, resource: vDp }] });
   // down: res -> b0 -> ... -> b5 ; up: b5 -> b4 (additive) ... -> b0
   bloomBG = [];
   for (let i = 0; i < NB; i++) bloomBG.push(blitBG(i ? vBl[i - 1] : vRes));
@@ -505,7 +513,7 @@ function render() {
   m[51] = zt;
   // exposure: brighter down in the water and at night (the eye adapts); from the room a fixed middle value
   let ek = cy < 0 && abs(cx) < m[60] && abs(cz) < m[62] ? (-cy - 5) / 22 : 0.45; ek = ek < 0 ? 0 : ek > 1 ? 1 : ek;
-  m[56] = EXPO * (0.6 + 0.4 * ek) * (1 + 0.9 * nightS); m[57] = RAYS * pow(lightS, 1.3); m[58] = det;
+  m[56] = EXPO * (0.6 + 0.4 * ek) * (1 + 0.9 * nightS); m[57] = RAYS * pow(lightS, 1.3); m[58] = det; m[59] = hlOn ? 1 : 0;
   // the last slice of a shadow re-bake goes out this frame: the scene already samples the new map with its matrix
   if (bakeStep === NSL) for (let i = 0; i < 16; i++) m[16 + i] = UBS[16 + i];
   Q.writeBuffer(ubo, 0, UB);
@@ -584,6 +592,13 @@ function render() {
     r.end();
   }
   // light shafts
+  // highlight life: the creature mask (cleared, and left empty, when it is off)
+  r = e.beginRenderPass(passMask);
+  if (hlOn) {
+    r.setBindGroup(0, bg0); r.setBindGroup(1, bgMask); r.setVertexBuffer(0, vbMesh); r.setVertexBuffer(1, instB, 0); r.setIndexBuffer(ibMesh, 'uint32');
+    for (let k = 0; k < 5; k++) if (kindN[k]) { const cm = CM[k]; r.setPipeline(pMask[k]); r.drawIndexed(cm.ib.length, kindN[k], cm.i0, cm.v0, kindOff[k]); }
+  }
+  r.end();
   r = e.beginRenderPass(passRays); r.setPipeline(pRays); r.setBindGroup(0, bgRays); r.draw(3); r.end();
   r = e.beginRenderPass(passBlur); r.setPipeline(pRB); r.setBindGroup(0, bgBlur); r.draw(3); r.end();
   // bloom
@@ -676,6 +691,9 @@ const nowa = window.nowa = {
     trackAt(id, now) { updateCreatures(now, 1 / 60); const t = trackOf(id); return t < 0 ? null : [tkP[t * 3], tkP[t * 3 + 1], tkP[t * 3 + 2]]; },
     director: () => ({ shot: ['orbit', 'glide', 'grotto', 'follow'][DS[S_KIND]], t: +DS[S_T].toFixed(1), dur: +DS[S_DUR].toFixed(1), subject: dirSubj || null, shots: DS[S_N], candidate: candId || null, score: +candScore.toFixed(1), caption: HS.el.hcap ? HS.el.hcap.textContent : '', blocked: dirSubj && trackOf(dirSubj) >= 0 ? rockBetween(F[DX], F[DY], F[DZ], tkP[trackOf(dirSubj) * 3], tkP[trackOf(dirSubj) * 3 + 1], tkP[trackOf(dirSubj) * 3 + 2], 0.4, true) : null }), audio: () => (AC ? AC.state : 'none') + (muted ? ', muted' : ''),
     // the lamp: where it is drawn, the shadow map's direction, re-bakes so far and the GPU ms of the last slices
+    // the highlight of creature id as if hunting (1) or fleeing (2), 0 to stop: to show the look when no chase happens
+    hlTest(id, mode = 1) { hlTestId = mode ? id >>> 0 : 0; hlTestMode = mode; },
+    highlight: (on) => { if (on !== undefined) setHighlight(on); return hlOn; },
     sun: () => ({ dir: [...SUNC].map((v) => +v.toFixed(3)), shadowDir: [...SUNB].map((v) => +v.toFixed(3)), baking: bakeStep, bakes: bakeN, sliceMs: [...SHMS].map((v) => +v.toFixed(2)) }),
     counts() { return WD && { terrainVerts: WD.T.nv, terrainTris: WD.T.ni / 3, leaves: WD.big.n, smallLeaves: WD.small.n, props: WD.props.map((p) => p.n), chips: WD.chunks.map((c) => c.n), rocks: WD.nSolid, glints: WD.nGl, bubbles: WD.nBub, grid: [NX, NY, NZ, VS] }; },
     // CPU time of n frames (update + encode) and the wall time until the GPU has finished them

@@ -1,6 +1,6 @@
 """Fetch, check and update the NOWA dependency without copying it into this repository.
 
-    python scripts/nowa_tool.py fetch            # vendor/nowa at the commit in nowa.lock
+    python scripts/nowa_tool.py fetch [--allow-upstream]   # vendor/nowa at the commit in nowa.lock
     python scripts/nowa_tool.py check            # compatibility check of vendor/nowa
     python scripts/nowa_tool.py status           # lock vs checkout vs upstream
     python scripts/nowa_tool.py update [--ref main] [--force]
@@ -47,10 +47,10 @@ def write_lock(commit: str) -> None:
 def head_of(path: Path) -> str | None:
     if not (path / ".git").exists():
         return None
-    try:
-        return git("rev-parse", "HEAD", cwd=path)
-    except subprocess.CalledProcessError:
-        return None
+    # stderr silenced: a fresh, still empty checkout has no HEAD, and git's advice text would only confuse
+    out = subprocess.run(["git", "rev-parse", "HEAD"], cwd=path, text=True,
+                         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    return out.stdout.strip() if out.returncode == 0 else None
 
 
 def _rmtree(path: Path) -> None:
@@ -88,11 +88,31 @@ def run_check(path: Path, write_baseline: bool = False) -> int:
     return subprocess.run(cmd, cwd=ROOT).returncode
 
 
-def cmd_fetch(_a) -> int:
+def cmd_fetch(a) -> int:
     lock = read_lock()
     VENDOR.mkdir(exist_ok=True)
-    checkout_commit(CHECKOUT, lock["repository"], lock["commit"])
-    print(f"NOWA {lock['commit'][:12]} -> {CHECKOUT}")
+    try:
+        checkout_commit(CHECKOUT, lock["repository"], lock["commit"])
+        print(f"NOWA {lock['commit'][:12]} -> {CHECKOUT}")
+    except subprocess.CalledProcessError:
+        # The tested commit is gone upstream (history rewritten, repository moved). Another NOWA version is used only
+        # with the user's explicit consent: a flag, or "y" at the prompt. The default keeps the install stable.
+        head = upstream_commit(lock["repository"], "main")
+        print(f"WARNING: NOWA commit {lock['commit'][:12]} from nowa.lock (the tested version) is not available "
+              f"upstream. The current NOWA is {head[:12]}; this project has not been tested with it.", file=sys.stderr)
+        allow = a.allow_upstream
+        if not allow and sys.stdin.isatty():
+            try:
+                allow = input(f"Use NOWA {head[:12]} instead? [y/N] ").strip().lower() in ("y", "yes", "д", "да")
+            except EOFError:                      # no input at all counts as "no"
+                print()
+                allow = False
+        if not allow:
+            print("Setup stopped: NOWA was not changed. To accept the current version, run "
+                  "`python scripts/nowa_tool.py fetch --allow-upstream`, then the setup again.", file=sys.stderr)
+            return 1
+        checkout_commit(CHECKOUT, lock["repository"], head)
+        print(f"NOWA {head[:12]} -> {CHECKOUT} (not the tested version; nowa.lock unchanged)")
     return 0
 
 
@@ -138,7 +158,10 @@ def cmd_update(a) -> int:
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = p.add_subparsers(dest="cmd", required=True)
-    sub.add_parser("fetch").set_defaults(fn=cmd_fetch)
+    f = sub.add_parser("fetch")
+    f.add_argument("--allow-upstream", action="store_true",
+                   help="if the locked commit is gone upstream, accept the current main (untested) instead of stopping")
+    f.set_defaults(fn=cmd_fetch)
     sub.add_parser("check").set_defaults(fn=cmd_check)
     s = sub.add_parser("status")
     s.add_argument("--ref", default="main")

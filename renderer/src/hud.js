@@ -6,7 +6,7 @@
 const HT = {
   ru: {
     day: 'День', pause: 'Пауза', turbo: 'Турбо', ach: 'факт', cam: ['Снаружи', 'Внутри', 'Следить', '🎬 Режиссёр'],
-    feed: 'Корм', spawn: 'Подселить', random: 'Случайно', saves: 'Сохранения', keys: 'Клавиши', snd: 'Звук', vol: 'Громкость',
+    feed: 'Корм', spawn: 'Подселить', random: 'Случайно', saves: 'Сохранить / Загрузить', keys: 'Клавиши', hl: 'Подсветка жизни (V)', snd: 'Звук', vol: 'Громкость',
     feedHint: 'Щёлкните в воду — бросить корм (Esc — выход)', spawnHint: 'Щёлкните, где появиться: {sp} (Esc — отмена)', miss: 'Щёлкните по воде в баке',
     pop: 'Население', share: 'доля от потолка', strip: 'внизу: планктон (зелёный) и питательные вещества (жёлтый); метки — вымирания и возвращения', births: 'рождений', deaths: 'смертей', gen: 'пок.', extinct: 'вымер', back: 'вернётся через',
     brains: 'мозги', proc: 'проц.', lag: 'ожиданий', ms: 'мс', food: 'частиц', plank: 'планктон',
@@ -14,7 +14,7 @@ const HT = {
     cover: 'в укрытии', tokens: 'Восприятие', affect: 'Аффект', neuro: 'Нейромодуляторы', family: 'Семья', parents: 'родители', children: 'детей',
     genes: 'Гены тела', speed: 'скорость', vision: 'зрение', metab: 'обмен', decisions: 'решений', episodes: 'эпизодов', sleeps: 'снов',
     showVision: 'Показать обзор', days: 'сут', none: '—', brainNo: 'Простое поведение, без NOWA', brainSleep: 'Мозг спит', brainStub: 'Мозг без аффекта (заглушка)',
-    savesT: 'Сохранения и настройки', name: 'Имя', save: 'Сохранить', saving: 'Сохраняю…', saved: 'Сохранено «{slot}» за {s} с, {size}',
+    savesT: 'Сохранить / Загрузить', saveT: 'Сохранить мир', loadT: 'Загрузить сохранение', impT: 'Импорт из файла', name: 'Имя', save: 'Сохранить', saving: 'Сохраняю…', saved: 'Сохранено «{slot}» за {s} с, {size}',
     load: 'Загрузить', loading: 'Загружаю «{slot}»…', loaded: 'Загружено', del: 'Удалить', sure: 'Точно?', exp: 'Скачать', imp: 'Импорт .zip',
     impAs: 'под именем', imported: 'Импортировано: {slot}', impFail: 'Импорт не удался: {e}', empty: 'Сохранений пока нет', close: 'Закрыть',
     simDay: 'сутки', crt: 'сущ.', settings: 'Настройки', repop: 'Возрождать вымершие виды', delay: 'Задержка, сим. мин', fmode: 'Основатели',
@@ -35,7 +35,7 @@ const HT = {
   },
   en: {
     day: 'Day', pause: 'Pause', turbo: 'Turbo', ach: 'actual', cam: ['Outside', 'Inside', 'Follow', '🎬 Director'],
-    feed: 'Feed', spawn: 'Spawn', random: 'Random', saves: 'Saves', keys: 'Keys', snd: 'Sound', vol: 'Volume',
+    feed: 'Feed', spawn: 'Spawn', random: 'Random', saves: 'Save / Load', keys: 'Keys', hl: 'Highlight life (V)', snd: 'Sound', vol: 'Volume',
     feedHint: 'Click into the water to drop food (Esc to stop)', spawnHint: 'Click where it should appear: {sp} (Esc to cancel)', miss: 'Click on the water in the tank',
     pop: 'Population', share: 'share of cap', strip: 'below: plankton (green) and nutrients (amber); ticks mark extinctions and returns', births: 'births', deaths: 'deaths', gen: 'gen', extinct: 'extinct', back: 'back in',
     brains: 'brains', proc: 'proc.', lag: 'lag waits', ms: 'ms', food: 'particles', plank: 'plankton',
@@ -43,7 +43,7 @@ const HT = {
     cover: 'in cover', tokens: 'Senses', affect: 'Affect', neuro: 'Neuromodulators', family: 'Family', parents: 'parents', children: 'children',
     genes: 'Body genes', speed: 'speed', vision: 'vision', metab: 'metabolism', decisions: 'decisions', episodes: 'episodes', sleeps: 'sleeps',
     showVision: 'Show vision', days: 'd', none: '—', brainNo: 'Simple behaviour, no NOWA', brainSleep: 'Brain asleep', brainStub: 'No affect (stub brain)',
-    savesT: 'Saves and settings', name: 'Name', save: 'Save', saving: 'Saving…', saved: 'Saved “{slot}” in {s} s, {size}',
+    savesT: 'Save / Load', saveT: 'Save the world', loadT: 'Load a save', impT: 'Import from a file', name: 'Name', save: 'Save', saving: 'Saving…', saved: 'Saved “{slot}” in {s} s, {size}',
     load: 'Load', loading: 'Loading “{slot}”…', loaded: 'Loaded', del: 'Delete', sure: 'Sure?', exp: 'Download', imp: 'Import .zip',
     impAs: 'as', imported: 'Imported: {slot}', impFail: 'Import failed: {e}', empty: 'No saves yet', close: 'Close',
     simDay: 'day', crt: 'crt.', settings: 'Settings', repop: 'Repopulate extinct species', delay: 'Delay, sim min', fmode: 'Founders',
@@ -130,7 +130,7 @@ function hudLang() {
     `<button id=hmenu title="${t.menu}">☰</button>` +
     `<span class="g opt" id=hcam>${t.cam.map((n, i) => `<button data-m="${i}">${n}</button>`).join('')}</span>` +
     `<span class="g opt"><button id=hfeed>🍤 ${t.feed}</button><select id=hsp>${spOpts}</select><button id=hspawn>✚ ${t.spawn}</button><button id=hrnd title="${t.random}">🎲</button></span>` +
-    `<span class="g opt"><button id=hlrnb>📈 ${t.learn}</button><button id=hobsb>🔭 ${ITL().title}</button><button id=hsav>💾 ${t.saves}</button><button id=hsnd title="${t.snd} (M)">🔊</button><input id=hvol type=range min=0 max=100 value=${round(uVol * 100)} title="${t.vol}"><button id=hkeys title="${t.keys}">?</button><button id=hlang>${LANG === 'ru' ? 'EN' : 'RU'}</button></span>`;
+    `<span class="g opt"><button id=hlrnb>📈 ${t.learn}</button><button id=hobsb>🔭 ${ITL().title}</button><button id=hsav>💾 ${t.saves}</button><button id=hhl title="${t.hl}" aria-label="${t.hl}">✨</button><button id=hsnd title="${t.snd} (M)">🔊</button><input id=hvol type=range min=0 max=100 value=${round(uVol * 100)} title="${t.vol}"><button id=hkeys title="${t.keys}">?</button><button id=hlang>${LANG === 'ru' ? 'EN' : 'RU'}</button></span>`;
   const q = (s) => HS.el.hbar.querySelector(s);
   HS.el.clk = q('#hclk span'); HS.el.ico = q('#hclk i'); HS.el.ach = q('#hach');
   HS.el.hbar.querySelectorAll('#hspd button').forEach((b) => { b.onclick = () => { const v = b.dataset.v, val = v === 'turbo' ? 'turbo' : +v; send({ t: 'speed', value: val }); HS.spdSet = val; markSpeed(); }; });
@@ -141,6 +141,7 @@ function hudLang() {
   q('#hspawn').onclick = () => setTool(HS.tool === 'spawn' ? '' : 'spawn');
   q('#hrnd').onclick = () => { send({ t: 'spawn', species: q('#hsp').value || HS.toolSp }); };
   q('#hsav').onclick = openSaves;
+  q('#hhl').onclick = () => setHighlight();
   q('#hlrnb').onclick = () => toggleLearn();
   q('#hobsb').onclick = () => toggleObs();
   q('#hmenu').onclick = () => HS.el.hbar.classList.toggle('open');
@@ -149,7 +150,7 @@ function hudLang() {
   q('#hvol').oninput = (e) => { sound(); setVol(e.target.value / 100); };
   q('#hkeys').onclick = () => { const k = $('k'), hide = !k.classList.contains('khide') && (k.classList.contains('kshow') || innerWidth > 900); k.classList.toggle('khide', hide); k.classList.toggle('kshow', !hide); keep('nowasea.keys', hide ? '0' : '1'); };
   q('#hlang').onclick = () => setLang(LANG === 'ru' ? 'en' : 'ru');
-  markSpeed(); markSound(); hudMode(); setTool(HS.tool);
+  markSpeed(); markSound(); markHL(); hudMode(); setTool(HS.tool);
   buildPop(); if (HS.stats) onStats(HS.stats);
   buildIns(); if (HS.ins) onInspect(HS.ins);
   buildLearn(); toggleLearn(!!HS.lrn); buildObs(); buildMini();
@@ -158,6 +159,7 @@ function hudLang() {
 function markSpeed() {
   HS.el.hbar.querySelectorAll('#hspd button').forEach((b) => b.classList.toggle('on', String(HS.spdSet) === b.dataset.v));
 }
+function markHL() { const b = HS.el.hbar && HS.el.hbar.querySelector('#hhl'); if (b) b.classList.toggle('on', hlOn); }
 function markSound() { const b = HS.el.hbar && HS.el.hbar.querySelector('#hsnd'); if (b) b.textContent = !AC || muted ? '🔇' : '🔊'; }
 // camera mode changed (called by legend())
 function hudMode() {
@@ -425,8 +427,8 @@ const hudBusy = () => !!(HS.tool || (HS.el.hmod && HS.el.hmod.classList.contains
 // ---------------------------------------------------------------- events: log + sounds
 function onEvent(m) {
   const t = TL(); let txt = '', col = '#7ff3ff';
-  if (m.kind === 'catch') { txt = `<b>${t.evCatch}</b>: ${esc(spName(m.species))} → ${esc(spName(m.prey))}`; col = '#ff8a7a'; if (m.pos) sfxAt('catch', 0.8, m.pos[0], m.pos[1], m.pos[2]); }
-  else if (m.kind === 'birth') { txt = `<b>${t.evBirth}</b>: ${esc(spName(m.species))}${m.generation !== undefined ? ` (${t.gen} ${esc(m.generation)})` : ''}`; col = '#9fe9a8'; if (m.pos) sfxAt('birth', 0.7, m.pos[0], m.pos[1], m.pos[2]); }
+  if (m.kind === 'catch') { txt = `<b>${t.evCatch}</b>: ${esc(spName(m.species))} → ${esc(spName(m.prey))}`; col = '#ff8a7a'; if (m.pos) { sfxAt('catch', 0.8, m.pos[0], m.pos[1], m.pos[2]); const s = spOf(m.species); if (s) hlFlash(0, s.index, m.pos[0], m.pos[1], m.pos[2]); } }
+  else if (m.kind === 'birth') { txt = `<b>${t.evBirth}</b>: ${esc(spName(m.species))}${m.generation !== undefined ? ` (${t.gen} ${esc(m.generation)})` : ''}`; col = '#9fe9a8'; if (m.pos) sfxAt('birth', 0.7, m.pos[0], m.pos[1], m.pos[2]); if (m.id) setTimeout(hlFlash, 400, m.id); }
   else if (m.kind === 'extinct') { txt = `<b>${t.evExtinct}</b>: ${esc(spName(m.species))}`; col = '#ffb36b'; }
   else if (m.kind === 'repopulate') { txt = `<b>${t.evRepop}</b>: ${esc(spName(m.species))} ×${esc(m.n ?? '')} (${m.mode === 'archive' ? t.archive : t.fresh})`; col = '#c9a7ff'; }
   else return;
@@ -480,9 +482,9 @@ function openSaves() {
   const t = TL(), box = HS.el.hmod.querySelector('.box');
   const d = new Date(), pad = (x) => String(x).padStart(2, '0'), def = `save-${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}`;
   box.innerHTML = `<h2>${t.savesT}<button class=x>✕</button></h2><div class=cols><div>` +
-    `<h4>${t.saves}</h4><div class=line><input type=text class=sn value="${def}" style="flex:1"><button class=sv>💾 ${t.save}</button></div>` +
-    `<div class=line><label class=fbtn>📂 ${t.imp}<input type=file class=fi accept=".zip" hidden></label> ${t.impAs} <input type=text class=in placeholder="imported" style="width:9em"></div>` +
-    `<div class=st></div><table class=ls></table></div><div>` +
+    `<section class=msave><h4>💾 ${t.saveT}</h4><div class=line><input type=text class=sn value="${def}" style="flex:1" aria-label="${t.name}"><button class=sv>💾 ${t.save}</button></div></section>` +
+    `<section class=mload><h4>📂 ${t.loadT}</h4><div class=st></div><table class=ls></table>` +
+    `<h4 class=mimp>${t.impT}</h4><div class=line><label class=fbtn>📦 ${t.imp}<input type=file class=fi accept=".zip" hidden></label> ${t.impAs} <input type=text class=in placeholder="imported" style="width:9em"></div></section></div><div>` +
     `<h4>${t.settings}</h4><div class=line><label><input type=checkbox class=re> ${t.repop}</label></div>` +
     `<div class=line>${t.delay} <input type=number class=dl min=0 step=0.5 style="width:5em"></div>` +
     `<div class=line>${t.fmode} <select class=fm><option value=fresh>${t.fresh}</option><option value=archive>${t.archive}</option></select></div>` +

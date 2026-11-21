@@ -33,3 +33,19 @@ def test_stub_ecosystem_runs_and_breeds():
     assert sim.births > 0
     assert sum(sim.populations().values()) > 0
     assert not pool.errors
+
+
+def test_waking_starts_a_fresh_decision_interval():
+    """sleep(duration) already advanced the core over the night: the first waking decision must not count the night
+    as time awake, and rewards gathered asleep must not go to the action chosen before sleep."""
+    pool = BrainPool(kind="stub", workers=0)
+    sim = Simulation(SimConfig(brain_kind="stub", scale=0.25), pool)
+    slot = next(s for s in sim.slot_of.values() if sim.sp[s] == BY_ID["sparkfin"].index)
+    sim.time = 5000.0
+    sim.sleeping[slot] = True
+    sim.last_decide[slot] = 4000.0
+    sim.reward[slot] = 0.7
+    sim._sleep_schedule(0.4)                    # mid-day: outside the sparkfin sleep window, so it wakes
+    assert not sim.sleeping[slot]
+    assert sim.last_decide[slot] == sim.time
+    assert sim.reward[slot] == 0.0

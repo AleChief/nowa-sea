@@ -791,6 +791,11 @@ class Simulation:
                 self.sleeping[slot] = False
                 self.intent[slot] = I[s.actions[0]]
                 m["urgent"] = True
+                # sleep(duration) already advanced the core's clock over the night: the first waking step
+                # must not count the night again as time awake, and night-time rewards do not belong to
+                # the action chosen before sleep
+                self.last_decide[slot] = self.time
+                self.reward[slot] = 0.0
 
     # ----- motor --------------------------------------------------------------------------------------
     def _motor(self, dt: float):
@@ -1126,7 +1131,8 @@ class Simulation:
 
     def _prey_density_factor(self, prey: Species) -> float:
         expected = max(2.0, prey.target * max(self.cfg.scale, 0.05))
-        return float(np.clip(self.count(prey.id) / (0.6 * expected), 0.1, 1.0))
+        # Squared: a remnant population (a quarter of the target or less) becomes nearly impossible to hunt out.
+        return float(np.clip((self.count(prey.id) / (0.6 * expected)) ** 2, 0.03, 1.0))
 
     def _make_child(self, a: int, b: int):
         s = SPECIES[self.sp[a]]
@@ -1194,7 +1200,7 @@ class Simulation:
                 self.age[self.slot_of[cid]] = 0.0
                 self.births += 1
 
-    SNOW_RATE = 0.16       # detritus flakes per second from plankton turnover (scaled by plankton biomass)
+    SNOW_RATE = 0.22       # detritus flakes per second from plankton turnover (scaled by plankton biomass)
 
     def _marine_snow(self, dt: float):
         expected = self.SNOW_RATE * dt * min(1.5, self.plankton.rho.mean() / 0.35)

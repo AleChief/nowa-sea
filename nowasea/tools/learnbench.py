@@ -22,7 +22,10 @@ def run(decisions: int, sleep_every: int, reward: float, bias: float, seed: int,
     from nowasea.brains import nowa_adapter as na
     from nowasea.brains.stub import RandomBrain
 
-    spec = na.BrainSpec("bench", ACTIONS, wake_interval_s=sleep_every * 1.5, hippocampus_capacity=128)
+    # The core samples actions from the module-level random (selector.py), not the agent's seeded RNG:
+    # without this a seed does not make a run reproducible.
+    random.seed(seed)
+    spec = na.BrainSpec("bench", ACTIONS, wake_interval_s=(sleep_every or 200) * 1.5, hippocampus_capacity=128)
     brain = na.NowaBrain(spec, genome=na.random_genome(random.Random(seed)), seed=seed) if kind == "nowa" \
         else RandomBrain(spec, seed=seed)
     rng = random.Random(seed + 1)
@@ -60,11 +63,12 @@ def main(argv=None) -> int:
     p.add_argument("--seeds", type=int, default=3)
     p.add_argument("--noise", type=int, default=0, help="extra irrelevant 3-level features per context")
     a = p.parse_args(argv)
-    out = {}
+    out, tails = {}, {}
     for kind in ("nowa", "random"):
         runs = [run(a.decisions, a.sleep_every, a.reward, a.bias, s, kind, a.noise) for s in range(a.seeds)]
         out[kind] = [round(sum(col) / len(col), 2) for col in zip(*runs)]
-    print(json.dumps({"args": vars(a), "evasive_share_per_150_decisions": out}))
+        tails[kind] = [round(sum(r[-3:]) / len(r[-3:]), 3) for r in runs]  # per seed: mean of the last 3 blocks
+    print(json.dumps({"args": vars(a), "evasive_share_per_150_decisions": out, "per_seed_last3": tails}))
     return 0
 
 

@@ -61,6 +61,20 @@ blended glass pass. The room: dark walls with a soft band lit by the tank, a flo
 stand, a dim ceiling and a glow towards the lamp. Cost at 1600×900 (Iris Xe): the copy plus the glass pass 1.5–1.9 ms;
 the whole frame +0.3–1.0 ms over the old blended glass (which it replaces).
 
+**Highlight life** (`V`, ✨ with the tooltip "Highlight life (V)" / "Подсветка жизни (V)", on by default): a thin
+game-style outline coloured by role, warm against the teal water: prey (sparkfin, sweeper) gold, predators (needlejaw,
+shade) coral red, lumen jellies a faint one. It is drawn in screen space, so it is a line at any viewing angle and never
+fills a body: after the scene every visible creature is drawn into a mask (`W_MASK`: role colour, strength in alpha;
+skipped where the scene's depth is nearer, so rock and kelp in front cut the line), and the post pass (`W_POST`) draws a
+2 px line where a pixel outside a silhouette has the mask next to it, plus a faint glow from a 5 px ring. The calm line
+is modest (sleep and cover dim it) and stronger for far creatures, which are also drawn up to 1.4× larger. Events raise
+it, smoothed on the CPU (`tkEx`, attack 0.2 s, release 1 s): speed above cruise, a burst, a hunting intent (chase /
+strike: brighter red with a slow pulse), a flight (flee or a burst of prey: gold turning white), and a short flash on a
+catch (the hunter nearest the catch) or a birth; events also add a thin rim on the body's own edge. Excitement, mode and
+flash ride in free floats of the instance record (no protocol change). `debug.hlTest(id, mode)` shows one creature as
+hunting (1) or fleeing (2), for checking the look. Cost at 1600×900 High: about +0.3 ms (the mask pass and the post
+taps).
+
 **The lamp moves.** On High and Medium the light follows `dayPhase`: east to west along the tank over the day
 (phase 0.15–0.85, 38–72° up), the dim night light on the same arc. The drawn direction eases towards it; when it is more
 than 3° away from the direction of the shadow map in use (and the last re-bake is 2 s old) the other of two shadow maps
@@ -80,7 +94,7 @@ one map. The second map costs 64 MB of GPU memory on High (16 MB on Medium).
 | click a creature | select it (`{"t":"select","id":N}`) and follow it; drag / wheel orbit and zoom around it; creatures behind rock are not picked |
 | `F` | follow the selected creature / stop following (the selection and the inspector stay) |
 | `Esc` | cancel a HUD tool or close the dialog; else stop following; else drop the selection |
-| `H`, `M` | stats line, sound |
+| `H`, `M`, `V` | stats line, sound, highlight life (on by default, remembered in `localStorage['nowasea.highlight']`) |
 | touch: one finger | orbit (outside, follow) / look (inside) |
 | touch: two fingers | pinch: zoom (outside, follow), swim forward / back (inside); drag: move the orbit centre (outside), swim (inside) |
 | touch: tap / double tap | select a creature (the camera stays) / follow it |
@@ -107,6 +121,7 @@ one map. The second map costs 64 MB of GPU memory on High (16 MB on Medium).
 | `debug.light` | number 0..1 overrides the stream's light level (screenshots); `null` = stream |
 | `debug.settle(s)`, `debug.bench(n, px)`, `debug.counts()`, `debug.audio()` | test helpers: advance smoothing by `s` seconds and draw; time `n` frames (with `px`: at that many pixels, the dynamic resolution paused; `gpuMs` is the mean, `glassMs` the copy plus the glass pass); scene sizes; audio context state |
 | `debug.glass`, `debug.phase`, `debug.sunFast`, `debug.sun()` | `false` draws the old blended glass (A/B); a number 0..1 overrides the stream's day phase; `true` re-bakes the shadows without the 2 s pause; the lamp's direction, the shadow map's, re-bakes so far and the GPU ms of the last slices |
+| `debug.highlight(on)`, `debug.hlTest(id, mode)` | highlight life on / off (`true` / `false`), returns the state; show creature `id` as hunting (1) or fleeing (2), 0 to stop |
 | `debug.screenOf(id)` | where a creature is on screen (client px) or `null` — for synthetic clicks and taps |
 | `debug.audioTest(n)` | renders 8 s of the ambience with `n` events (default 24) in an `OfflineAudioContext`; returns `{peak, peakDb, rms, rmsDb, voicesPlayed}` |
 | `debug.capture(w, h, q)`, `debug.captureHud(w, h, q)` | a frame as a JPEG `Blob`: the scene only, or with the HUD and the key legend (the HTML copied into an SVG `foreignObject`) — for documentation screenshots |
@@ -123,11 +138,11 @@ clicks; the one per-frame part, `hudFrame()`, draws the vision cone on a 2D canv
 
 | Part | What it does |
 |---|---|
-| top bar | day number and clock (`day_s` = 24 h), ☀ / ☾; speed `Pause 1× 2× 5× 10× Turbo` (`{"t":"speed"}`) with the achieved speed (orange below 80 % of the set one); camera `Outside / Inside / Follow / Director`; `Feed`, species list, `Spawn`, 🎲 (spawn at random); `Learning`; `Saves`; sound on / off and volume (remembered in `localStorage['nowasea.snd']`); `?` (key legend); language. Below 900 px the bar keeps the clock and speed, the rest opens from ☰, and the key legend shows only on `?` |
+| top bar | day number and clock (`day_s` = 24 h), ☀ / ☾; speed `Pause 1× 2× 5× 10× Turbo` (`{"t":"speed"}`) with the achieved speed (orange below 80 % of the set one); camera `Outside / Inside / Follow / Director`; `Feed`, species list, `Spawn`, 🎲 (spawn at random); `Learning`; `Insights`; `💾 Save / Load`; ✨ highlight life (`V`); sound on / off and volume (remembered in `localStorage['nowasea.snd']`); `?` (key legend); language. Below 900 px the bar keeps the clock and speed, the rest opens from ☰, and the key legend shows only on `?` |
 | population | per species: colour chip, count / cap (`round(cap × scale)`, at least 2), highest generation, extinction countdown; chart of `history` as count / cap; births, deaths, brain kind (`stats.settings.brain`: NOWA, or reflex / random as controls) and load (workers, brains, p95, lag waits), particles, plankton. Collapsible (remembered) |
 | Feed | click mode: from the room, where the click ray meets the layer y = −1, moved to the nearest point of that layer inside the tank (a ray that never comes down: the point of it nearest the tank's centre line); from the water 3 m along the ray; sends `{"t":"feed","pos":[x,y,z]}` per click until Esc |
 | Spawn | the species in the list at the next clicked point (`{"t":"spawn","species","pos"}`) or 🎲 without a point; replies `spawned` / the cap `toast` are shown |
-| Saves | list (`list_saves`), save under a name (default `save-YYYYMMDD-HHMM`; shows `saved.seconds`), load, download (`/api/saves/<slot>.zip`), delete (second click confirms), import a `.zip` (POST `/api/saves/import?slot=`) |
+| Save / Load | one dialog, two framed sections and the settings beside: save (a name, default `save-YYYYMMDD-HHMM`, and a button; shows `saved.seconds`); load (the list with load, download `/api/saves/<slot>.zip`, delete — a second click confirms), with import of a `.zip` below (POST `/api/saves/import?slot=`) |
 | Settings | repopulation on / off, delay in sim minutes, founders fresh / archive, autosave off / 5 / 15 / 60 sim min (`{"t":"settings"}`); the form follows `stats.settings` |
 | inspector | for the selected creature: name and id, generation, age / lifespan, energy and stamina, intent, decision mode, asleep / in cover, what the brain is told (`tokens`, the 2–3 salient ones, highlighted) and the senses (`senses`, everything perceived, muted), 8 affect axes and 5 neuromodulators (NOWA species) and the experiences lost before sleep (`brain.lost_unconsolidated`), body genes, decisions / episodes / sleeps; family: a compact tree from `{"t":"lineage","id","up":4,"down":3}` (asked for on selection and every 8 s), ancestors in rows above (parents, grandparents, …), descendants below, living ones in their species colour (click to follow), the dead greyed with the cause (🦷 eaten, 🍂 starvation, ⌛ old age, ✖ removed) and dates in the tooltip; genome (NOWA species): the 39 genes of `hello.genes` grouped by module (Russian names in RU), collapsible (remembered), each a bar over its `[min, max]` with a tick at the default, the description and values in the tooltip, plus the epigenome size; `Show vision` draws the view cone (vision radius, `fov_deg`, rings at ⅓ and ⅔) and a line to `target`, plus a top-down map of the tank in the bottom-right corner (rock and kelp, every creature, the selected one's field of view, the camera) |
 | learning | `stats.learning` per NOWA species: one row per generation (0 = founders) with n (alive + dead); first, with bars, choice quality (share of decisions that fitted the situation: `evade` for prey, `hunt` for hunters, `feed` where measured; `reflex` would score about 100 %, `random` about 30 %); then lifespan (mean age at death), reward per decision, and catch (hunters) / escape (prey) rates (values only); a sparkline of the same numbers in each header; rows with n < 3 faded; no smoothing; a caption explains each metric |

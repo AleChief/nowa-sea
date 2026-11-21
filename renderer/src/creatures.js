@@ -33,8 +33,8 @@ function setSpecies(hello) {
     const act = s.actions || [];
     spHunt[i] = act.includes('strike') || act.includes('chase') ? 1 : 0; spPrey[i] = act.includes('flee') ? 1 : 0; spGlowy[i] = k === 4 || k === 0 ? 1 : 0;
   }
-  itBend.fill(0); itFlat.fill(0); itHunt.fill(0);
-  (hello.intents || []).forEach((n, i) => { if (n === 'ambush' || n === 'stalk') itBend[i] = 1; if (n === 'burrow') itFlat[i] = 1; if (n === 'chase' || n === 'strike') itHunt[i] = 1; });
+  itBend.fill(0); itFlat.fill(0); itHunt.fill(0); itFlee.fill(0);
+  (hello.intents || []).forEach((n, i) => { if (n === 'flee') itFlee[i] = 1; if (n === 'ambush' || n === 'stalk') itBend[i] = 1; if (n === 'burrow') itFlat[i] = 1; if (n === 'chase' || n === 'strike') itHunt[i] = 1; });
 }
 
 // ---------------------------------------------------------------- tracks
@@ -43,6 +43,10 @@ const tkP = new Float32Array(MAXT * 3), tkV = new Float32Array(MAXT * 3), tkF = 
 const tkPh = new Float32Array(MAXT), tkVis = new Float32Array(MAXT), tkGlow = new Float32Array(MAXT), tkBend = new Float32Array(MAXT), tkFlat = new Float32Array(MAXT), tkSeed = new Float32Array(MAXT), tkSz = new Float32Array(MAXT);
 const tkFl = new Uint8Array(MAXT), tkGl = new Uint8Array(MAXT), tkIt = new Uint8Array(MAXT), tkKind = new Uint8Array(MAXT);
 // burst pose: sustained tail amplitude (0..1) and a C-flex impulse at the onset, its side alternating
+// highlight life: excitement (speed above cruise, a chase, a flight; attack 0.2 s, release 1 s), mode (1 hunting,
+// 2 fleeing) and a short flash (catch, birth)
+let hlTestId = 0, hlTestMode = 0; // debug.hlTest: show one creature as hunting (1) or fleeing (2)
+const tkEx = new Float32Array(MAXT), tkMode = new Uint8Array(MAXT), tkFlash = new Float32Array(MAXT), itFlee = new Uint8Array(256);
 const tkBurst = new Float32Array(MAXT), tkFlex = new Float32Array(MAXT), tkFlexS = new Float32Array(MAXT).fill(1), tkWasB = new Uint8Array(MAXT);
 const tkList = new Int32Array(MAXT), tkFree = new Int32Array(MAXT);
 let tkN = 0, tkNF = 0;
@@ -56,6 +60,7 @@ function hRebuild() { hV.fill(-1); for (let i = 0; i < tkN; i++) hPut(tkId[tkLis
 function tkAlloc(id, s, i) {
   if (!tkNF) return -1;
   const t = tkFree[--tkNF]; tkList[tkN++] = t; hPut(id, t);
+  tkEx[t] = 0; tkMode[t] = 0; tkFlash[t] = 0;
   tkId[t] = id; tkSt[t] = 1; tkHas[t] = 0; tkVis[t] = 0; tkBend[t] = 0; tkFlat[t] = 0; tkGlow[t] = 0; tkBurst[t] = 0; tkFlex[t] = 0; tkWasB[t] = 0;
   for (let r = 0; r < RING; r++) tkRow[t * RING + r] = -1;
   const sp = s.species[i]; tkSp[t] = sp; tkKind[t] = spKind[sp];
@@ -198,6 +203,15 @@ function updateCreatures(now, dt) {
     tkBurst[t] += (bu - tkBurst[t]) * (1 - exp(-dt * (bu ? 8 : 3)));
     tkFlex[t] *= exp(-dt * 4.5);
     tkFlat[t] += (flat - tkFlat[t]) * kS;
+    {
+      const hunt = spHunt[sp] && itHunt[tkIt[t]] ? 1 : 0, flee = !hunt && spPrey[sp] && (itFlee[tkIt[t]] || (fl & 2)) ? 1 : 0;
+      let et = (v / spCruise[sp] - 1.15) / 1.6; et = et < 0 ? 0 : et > 1 ? 1 : et;
+      if (fl & 2) et = max(et, 0.9); if (hunt || flee) et = max(et, 0.75);
+      if (hlTestId && tkId[t] === hlTestId) et = 1;
+      tkMode[t] = hlTestId && tkId[t] === hlTestId ? hlTestMode : hunt ? 1 : flee ? 2 : 0;
+      tkEx[t] += (et - tkEx[t]) * (1 - exp(-dt / (et > tkEx[t] ? 0.2 : 1)));
+      tkFlash[t] *= exp(-dt * 2.2);
+    }
     if (tkVis[t] > 0.01) kindN[kind]++;
   }
   // pack, grouped by body plan
@@ -212,8 +226,8 @@ function updateCreatures(now, dt) {
     CI[j + 4] = tkF[o]; CI[j + 5] = tkF[o + 1]; CI[j + 6] = tkF[o + 2]; CI[j + 7] = tkPh[t];
     CI[j + 8] = tkU[o]; CI[j + 9] = tkU[o + 1]; CI[j + 10] = tkU[o + 2]; CI[j + 11] = tkGlow[t];
     CI[j + 12] = sp; CI[j + 13] = tkFl[t]; CI[j + 14] = tkBend[t]; CI[j + 15] = tkVis[t];
-    CI[j + 16] = tkSeed[t]; CI[j + 17] = sqrt(tkV[o] * tkV[o] + tkV[o + 1] * tkV[o + 1] + tkV[o + 2] * tkV[o + 2]) / spCruise[sp]; CI[j + 18] = tkFlat[t]; CI[j + 19] = 0;
-    CI[j + 20] = tkBurst[t]; CI[j + 21] = tkFlex[t] * tkFlexS[t]; CI[j + 22] = 0; CI[j + 23] = 0;
+    CI[j + 16] = tkSeed[t]; CI[j + 17] = sqrt(tkV[o] * tkV[o] + tkV[o + 1] * tkV[o + 1] + tkV[o + 2] * tkV[o + 2]) / spCruise[sp]; CI[j + 18] = tkFlat[t]; CI[j + 19] = tkMode[t];
+    CI[j + 20] = tkBurst[t]; CI[j + 21] = tkFlex[t] * tkFlexS[t]; CI[j + 22] = tkEx[t]; CI[j + 23] = tkFlash[t];
   }
   // particles of the same snapshot: position, radius (size byte is the diameter in cm), kind
   const m = sb.m;
@@ -255,3 +269,16 @@ function pickNext(sx, sy, w, h, M, tanh, after) {
 }
 // track slot of a creature id that is on screen, or -1
 const trackOf = (id) => { if (!id) return -1; if (hDirty) hRebuild(); const t = hFind(id); return t >= 0 && tkHas[t] ? t : -1; };
+
+// a short highlight flash: creature id, or (species index, position) for the nearest of that species
+function hlFlash(id, sp, x, y, z) {
+  let best = -1, bd = 1e9;
+  for (let li = 0; li < tkN; li++) {
+    const t = tkList[li];
+    if (id) { if (tkId[t] === id) { best = t; break; } continue; }
+    if (tkSp[t] !== sp) continue;
+    const dx = tkP[t * 3] - x, dy = tkP[t * 3 + 1] - y, dz = tkP[t * 3 + 2] - z, d = dx * dx + dy * dy + dz * dz;
+    if (d < bd) { bd = d; best = t; }
+  }
+  if (best >= 0 && (id || bd < 64)) tkFlash[best] = 1;
+}

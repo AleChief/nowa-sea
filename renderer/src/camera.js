@@ -8,7 +8,7 @@ const TXT_RU = {
   modes: ['Снаружи', 'Внутри', 'Следить', 'Режиссёр'], cycle: 'по кругу', dirHint: 'любое действие возвращает управление',
   inside: 'плыть', look: 'мышь — обзор (щёлкните, чтобы захватить)', updown: 'вниз / вверх', fast: 'быстрее',
   outside: 'тяните — вращать, колесо — приблизить (сквозь стекло — внутрь)',
-  follow: 'щелчок по существу — выбрать и следовать', leave: 'следовать / отпустить, Esc — снять выбор', stats: 'статистика', mute: 'звук', detail: 'Детали:',
+  hl: 'подсветка жизни', follow: 'щелчок по существу — выбрать и следовать', leave: 'следовать / отпустить, Esc — снять выбор', stats: 'статистика', mute: 'звук', detail: 'Детали:',
   lv: ['Мин', 'Сред', 'Макс'],
 };
 const TXT_EN = {
@@ -18,7 +18,7 @@ const TXT_EN = {
   modes: ['Outside', 'Inside', 'Follow', 'Director'], cycle: 'cycle', dirHint: 'any input takes the camera back',
   inside: 'swim', look: 'mouse look (click to capture)', updown: 'down / up', fast: 'faster',
   outside: 'drag to orbit, wheel to zoom (through the glass to dive in)',
-  follow: 'click a creature to select and follow it', leave: 'follow / stop, Esc drops the selection', stats: 'stats', mute: 'sound', detail: 'Detail:',
+  hl: 'highlight life', follow: 'click a creature to select and follow it', leave: 'follow / stop, Esc drops the selection', stats: 'stats', mute: 'sound', detail: 'Detail:',
   lv: ['Low', 'Med', 'High'],
 };
 // interface language: remembered choice, else the browser's; setLang switches every text (legend, HUD)
@@ -43,6 +43,10 @@ const FOY = 45, FOP = 46, FOD = 47, FOYS = 48, FOPS = 49, FODS = 50, FLX = 51, F
 const IX = 54, IY = 55, IZ = 56, IYAW = 57, IPIT = 58, CPU = 59;
 const MODES = ['outside', 'inside', 'follow', 'director'];
 let camMode = 0, followId = 0, insideSet = false, tHx = 40, tDep = 30, tHz = 25;
+// "highlight life": a thin outline around every creature (shaders.js: W_MASK, W_POST); on unless switched off (remembered)
+let hlOn = true;
+try { hlOn = localStorage['nowasea.highlight'] !== '0'; } catch {}
+function setHighlight(on) { hlOn = on === undefined ? !hlOn : !!on; keep('nowasea.highlight', hlOn ? '1' : '0'); markHL(); }
 F[TRK] = 1; F[OYAW] = F[OYS] = -0.42; F[OPIT] = F[OPS] = 0.34; F[ODIST] = F[ODS] = 100; F[OTY] = -15; F[FOD] = F[FODS] = 1; F[FOP] = F[FOPS] = 0.22; F[FOY] = F[FOYS] = 0.5;
 const inBox = (x, y, z, m) => abs(x) < tHx - m && abs(z) < tHz - m && y < -m && y > -tDep + m;
 const wrapA = (a) => a - TAU * floor((a + PI) / TAU);
@@ -253,6 +257,7 @@ function initInput() {
       default: if (v && !e.repeat) {
         if (e.code === 'KeyH') { hud = !hud; info.textContent = ''; }
         else if (e.code === 'KeyM') mute();
+        else if (e.code === 'KeyV') setHighlight();
         else if (e.code === 'Digit1') setMode(0);
         else if (e.code === 'Digit2') setMode(1);
         else if (e.code === 'Digit3') setMode(2);
@@ -365,7 +370,7 @@ function legend() {
   const b = (k) => `<b>${k}</b>`, md = (i) => `<span class="${i === camMode ? 'on' : ''}">${b(i + 1)}${TXT.modes[i]}</span>`;
   el.innerHTML = `${md(0)} · ${md(1)} · ${md(2)} · ${b('C')}${TXT.cycle} · ${md(3)} (${TXT.dirHint})<br>` +
     `${b('W')}${b('A')}${b('S')}${b('D')}${TXT.inside} · ${TXT.look} · ${b('Q')}${b('E')}${TXT.updown} · ${b('Shift')}${TXT.fast}<br>` +
-    `${TXT.outside}<br>${TXT.follow} · ${b('F')}${TXT.leave} · ${b('H')}${TXT.stats} · ${b('M')}${TXT.mute} · ${TXT.detail}` +
+    `${TXT.outside}<br>${TXT.follow} · ${b('F')}${TXT.leave} · ${b('H')}${TXT.stats} · ${b('M')}${TXT.mute} · ${b('V')}${TXT.hl} · ${TXT.detail}` +
     TXT.lv.map((n, i) => `<button class="q${2 - i === LV ? ' on' : ''}" data-q="${2 - i}">${n}</button>`).join('');
   el.querySelectorAll('button').forEach((x) => { x.onclick = () => { keep(QKEY, x.dataset.q); keep(LKEY, ''); const u = new URL(location.href); u.searchParams.delete('q'); location.href = u.href; }; });
 }

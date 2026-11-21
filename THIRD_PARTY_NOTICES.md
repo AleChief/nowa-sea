@@ -1,5 +1,8 @@
 # Third-party components
 
+The MIT license in `LICENSE` covers the code of this repository only. It does not cover NOWA, which is fetched
+separately and stays under its own license (below).
+
 ## NOWA-Bio-Inspired-AI — not included
 
 - Source: https://github.com/burlakovmb/NOWA-Bio-Inspired-AI (author: Mikhail Burlakov)

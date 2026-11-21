@@ -71,6 +71,7 @@ def main(argv=None) -> int:
                "deaths_by_cause": src.sim.deaths, "births": src.sim.births,
                "deaths_by_species": src.sim.deaths_sp, "births_by_species": src.sim.births_sp,
                "learning": src.sim.learning_summary(max_gens=50),
+               "insights": src.sim.insights.summary(src.sim),
                "pop_mean": {k: round(sum(r["pop"][k] for r in samples) / max(1, len(samples)), 2)
                             for k in (samples[0]["pop"] if samples else {})},
                "p95_ms_last": samples[-1]["p95_ms"] if samples else None}

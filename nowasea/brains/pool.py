@@ -7,6 +7,7 @@ Engine-independent: requests carry only tokens, rewards and times.
 
 from __future__ import annotations
 
+import gc
 import itertools
 import multiprocessing as mp
 import os
@@ -28,10 +29,10 @@ Answer = Tuple[int, str, str, bool, float]
 
 
 def _brain_class(kind: str):
-    if kind == "stub":
-        from nowasea.brains.stub import StubBrain
+    if kind in ("stub", "reflex", "random"):
+        from nowasea.brains import stub
 
-        return StubBrain
+        return {"stub": stub.StubBrain, "reflex": stub.ReflexBrain, "random": stub.RandomBrain}[kind]
     from nowasea.brains.nowa_adapter import NowaBrain
 
     return NowaBrain
@@ -47,13 +48,14 @@ class BrainHost:
         self.locks: Dict[int, threading.Lock] = defaultdict(threading.Lock)
         self.sleeping: set[int] = set()
         self.out: "queue.Queue[tuple]" = queue.Queue()
+        self._last_gc = 0.0
         self._sleep_q: "queue.Queue[tuple]" = queue.Queue()
         self._sleeper = threading.Thread(target=self._sleep_loop, daemon=True, name="brain-sleeper")
         self._sleeper.start()
 
     def _sleep_loop(self):
         while True:
-            bid, cycles = self._sleep_q.get()
+            bid, cycles, duration = self._sleep_q.get()
             brain = self.brains.get(bid)
             if brain is None:
                 self.sleeping.discard(bid)
@@ -61,7 +63,10 @@ class BrainHost:
             t = time.perf_counter()
             try:
                 with self.locks[bid]:
-                    brain.sleep(cycles)
+                    try:
+                        brain.sleep(cycles, duration)
+                    except TypeError:          # brains without a duration parameter
+                        brain.sleep(cycles)
                 err = None
             except Exception as exc:  # noqa: BLE001
                 err = f"{type(exc).__name__}: {exc}"
@@ -81,33 +86,46 @@ class BrainHost:
                 with self.locks[bid]:
                     info = brain.decide(tokens, executed_prev=executed, reward_prev=reward, elapsed=elapsed,
                                         novelty=novelty, conflict=conflict, bias=bias)
-                answers.append((bid, info.action, info.mode, info.no_action, (time.perf_counter() - t) * 1000.0))
+                answers.append((bid, info.action, info.mode, info.no_action, (time.perf_counter() - t) * 1000.0,
+                                getattr(info, "mood", None)))
             return ("decided", answers)
         if op == "create":
             _, bid, spec, genome, epigenome, seed = msg
             self.brains[bid] = self.cls(BrainSpec(**spec), genome=genome, epigenome=epigenome, seed=seed)
-            return ("created", bid, self.brains[bid].genome())
+            return ("created", bid)
         if op == "load":
             _, bid, spec, path, host_state, seed = msg
             self.brains[bid] = self.cls.load(BrainSpec(**spec), Path(path), host_state, seed=seed)
-            return ("created", bid, self.brains[bid].genome())
+            return ("created", bid)
         if op == "sleep":
-            _, bid, cycles = msg
+            _, bid, cycles, duration = msg
             if bid in self.brains and bid not in self.sleeping:
                 self.sleeping.add(bid)
-                self._sleep_q.put((bid, cycles))
+                self._sleep_q.put((bid, cycles, duration))
             return None
         if op == "remove":
             self.brains.pop(msg[1], None)
+            self.locks.pop(msg[1], None)
             self.sleeping.discard(msg[1])
+            # NOWA agents hold reference cycles: without a full collection a dead brain's memory waits for a
+            # rare generation-2 pass and the worker's RSS creeps up. At most one full pass per 30 s.
+            now = time.monotonic()
+            if now - self._last_gc > 30.0:
+                self._last_gc = now
+                gc.collect()
             return None
         if op == "epigenome":
             _, rid, bid = msg
             brain = self.brains.get(bid)
             if brain is None:
                 return ("reply", rid, None)
-            with self.locks[bid]:
+            # A sleeping brain is locked for seconds: answer at once without its epigenome.
+            if bid in self.sleeping or not self.locks[bid].acquire(timeout=0.05):
+                return ("reply", rid, {"genome": None, "epigenome": None, "busy": True})
+            try:
                 return ("reply", rid, {"genome": brain.genome(), "epigenome": brain.epigenome()})
+            finally:
+                self.locks[bid].release()
         if op == "inspect":
             _, rid, bid = msg
             brain = self.brains.get(bid)
@@ -143,6 +161,9 @@ class BrainHost:
 
 
 def _worker_main(conn, kind: str, nowa_path: Optional[str]):
+    import signal
+
+    signal.signal(signal.SIGINT, signal.SIG_IGN)   # the parent decides when we stop (autosave on shutdown)
     if nowa_path:
         os.environ["NOWA_PATH"] = nowa_path
     try:
@@ -181,13 +202,16 @@ class BrainPool:
         self.pending: Dict[int, float] = {}         # id -> wall time of the outstanding request
         self.answers: List[Answer] = []
         self.slept: List[Tuple[int, float, Optional[str]]] = []
-        self.created_genomes: Dict[int, dict] = {}
+        self.created: set = set()                   # brains confirmed by their worker
         self.errors: List[str] = []
         self._rid = itertools.count(1)
         self._replies: Dict[int, object] = {}
         self.cost_ms: List[float] = []
         self.sleep_ms: List[float] = []
         self.decisions_done = 0
+        # A Connection must not be read or written by two threads at once (frames interleave).
+        self._io = threading.RLock()
+        self._sent = 0
         if self.workers == 0:
             self._inline = BrainHost(kind)
             self._conns = []
@@ -206,6 +230,10 @@ class BrainPool:
 
     # ----- plumbing -------------------------------------------------------------------------------
     def _send(self, shard: int, msg: tuple) -> None:
+        with self._io:
+            self._send_locked(shard, msg)
+
+    def _send_locked(self, shard: int, msg: tuple) -> None:
         if self._inline is not None:
             reply = self._inline.handle(msg)
             if reply is not None:
@@ -234,19 +262,20 @@ class BrainPool:
             if len(self.sleep_ms) > 500:
                 del self.sleep_ms[:250]
         elif op == "created":
-            self.created_genomes[reply[1]] = reply[2]
+            self.created.add(reply[1])
         elif op == "reply":
             self._replies[reply[1]] = reply[2]
         elif op == "error":
             self.errors.append(reply[1] + "\n" + reply[2])
 
     def poll(self) -> None:
-        if self._inline is not None:
-            self._drain_inline()
-            return
-        for conn in self._conns:
-            while conn.poll(0):
-                self._on_reply(conn.recv())
+        with self._io:
+            if self._inline is not None:
+                self._drain_inline()
+                return
+            for conn in self._conns:
+                while conn.poll(0):
+                    self._on_reply(conn.recv())
 
     def _shard_for(self, bid: int) -> int:
         if bid not in self.assign:
@@ -257,8 +286,9 @@ class BrainPool:
         return self.assign[bid]
 
     def _call(self, shard: int, msg_fn, timeout: float = 120.0):
-        rid = next(self._rid)
-        self._send(shard, msg_fn(rid))
+        with self._io:
+            rid = next(self._rid)
+            self._send(shard, msg_fn(rid))
         deadline = time.time() + timeout
         while rid not in self._replies:
             if time.time() > deadline:
@@ -266,16 +296,27 @@ class BrainPool:
             self.poll()
             if rid not in self._replies:
                 time.sleep(0.002)
-        return self._replies.pop(rid)
+        with self._io:
+            return self._replies.pop(rid)
 
     # ----- API ------------------------------------------------------------------------------------
     def create(self, bid: int, spec: BrainSpec, genome=None, epigenome=None, seed=None) -> None:
         self._send(self._shard_for(bid), ("create", bid, asdict(spec), genome, epigenome, seed))
+        self._sent += 1
+        if self._sent % 16 == 0:
+            self.poll()                          # drain replies so neither side blocks on a full pipe
 
     def load(self, bid: int, spec: BrainSpec, path: str, host_state: dict, seed=None) -> None:
         self._send(self._shard_for(bid), ("load", bid, asdict(spec), str(path), host_state, seed))
+        self._sent += 1
+        if self._sent % 16 == 0:
+            self.poll()
 
     def submit(self, requests: List[Request]) -> None:
+        with self._io:
+            self._submit_locked(requests)
+
+    def _submit_locked(self, requests: List[Request]) -> None:
         by_shard: Dict[int, List[Request]] = defaultdict(list)
         now = time.time()
         for r in requests:
@@ -287,19 +328,22 @@ class BrainPool:
             self._send(shard, ("decide", batch))
 
     def take_answers(self) -> List[Answer]:
-        self.poll()
-        out, self.answers = self.answers, []
+        with self._io:
+            self.poll()
+            out, self.answers = self.answers, []
         return out
 
     def take_slept(self):
-        self.poll()
-        out, self.slept = self.slept, []
+        with self._io:
+            self.poll()
+            out, self.slept = self.slept, []
         return out
 
-    def sleep(self, bid: int, cycles: int) -> None:
-        self._send(self._shard_for(bid), ("sleep", bid, int(cycles)))
+    def sleep(self, bid: int, cycles: int, duration_s: float = 0.0) -> None:
+        self._send(self._shard_for(bid), ("sleep", bid, int(cycles), float(duration_s)))
 
     def remove(self, bid: int) -> None:
+        self.created.discard(bid)
         if bid in self.assign:
             self._send(self.assign[bid], ("remove", bid))
             del self.assign[bid]
@@ -356,6 +400,7 @@ class BrainPool:
         self.pending.clear()
         self.answers.clear()
         self.slept.clear()
+        self.created.clear()
 
     def wait_idle(self, timeout: float = 60.0) -> None:
         deadline = time.time() + timeout

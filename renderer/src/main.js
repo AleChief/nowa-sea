@@ -41,6 +41,8 @@ const sRep = device.createSampler({ addressModeU: 'repeat', addressModeV: 'repea
 const sClamp = device.createSampler({ magFilter: 'linear', minFilter: 'linear' });
 const sCmp = device.createSampler({ compare: 'less-equal', magFilter: 'linear', minFilter: 'linear' });
 const tShadow = tex(SHADOW, SHADOW, DEPTH, TU.RENDER_ATTACHMENT | TU.TEXTURE_BINDING);
+// High, Medium: the lamp moves with the day, and a second shadow map is re-baked in the background (main.js, updateSun)
+const MOVE = LV < 2, tShadow2 = MOVE ? tex(SHADOW, SHADOW, DEPTH, TU.RENDER_ATTACHMENT | TU.TEXTURE_BINDING) : null;
 const tDummy = tex(1, 1, DEPTH, TU.RENDER_ATTACHMENT | TU.TEXTURE_BINDING);
 const tWater = tex(WATER, WATER, HDR, TU.RENDER_ATTACHMENT | TU.TEXTURE_BINDING, { mips: 5 });
 const tDetail = tex(1024, 1024, 'rgba8unorm', TU.RENDER_ATTACHMENT | TU.TEXTURE_BINDING, { mips: 11 });
@@ -67,7 +69,7 @@ const mkBG0 = (u, sh) => device.createBindGroup({ layout: bgl0, entries: [
   { binding: 0, resource: { buffer: u } }, { binding: 1, resource: sRep }, { binding: 2, resource: sClamp }, { binding: 3, resource: sCmp },
   { binding: 4, resource: sh.createView() }, { binding: 5, resource: tWater.createView() }, { binding: 6, resource: tDetail.createView() },
   { binding: 7, resource: tVol.createView() }, { binding: 8, resource: tMap.createView() }, { binding: 9, resource: tPl.createView() }, { binding: 10, resource: { buffer: spcBuf } }] });
-let bg0, bg0s;
+let bg0, bg0s, bg0x, shIdx = 0;
 const pl0 = device.createPipelineLayout({ bindGroupLayouts: [bgl0] });
 
 const bglBlit = device.createBindGroupLayout({ entries: [{ binding: 0, visibility: SS.FRAGMENT, texture: {} }, { binding: 1, visibility: SS.FRAGMENT, sampler: {} }] });
@@ -84,7 +86,7 @@ const A = (shaderLocation, offset, format) => ({ shaderLocation, offset, format 
 const vbSolid = { arrayStride: 16, attributes: [A(0, 0, 'float32x3'), A(1, 12, 'snorm8x4')] };
 const ibSolid = { arrayStride: 48, stepMode: 'instance', attributes: [A(2, 0, 'float32x4'), A(3, 16, 'float32x4'), A(4, 32, 'float32x4')] };
 const ibLeaf = { arrayStride: 36, stepMode: 'instance', attributes: [A(0, 0, 'float32x4'), A(1, 16, 'float32x4'), A(2, 32, 'unorm8x4')] };
-const ibCre = { arrayStride: CSTR * 4, stepMode: 'instance', attributes: [A(2, 0, 'float32x4'), A(3, 16, 'float32x4'), A(4, 32, 'float32x4'), A(5, 48, 'float32x4'), A(6, 64, 'float32x4')] };
+const ibCre = { arrayStride: CSTR * 4, stepMode: 'instance', attributes: [A(2, 0, 'float32x4'), A(3, 16, 'float32x4'), A(4, 32, 'float32x4'), A(5, 48, 'float32x4'), A(6, 64, 'float32x4'), A(7, 80, 'float32x4')] };
 const ibBub = { arrayStride: 32, stepMode: 'instance', attributes: [A(0, 0, 'float32x4'), A(1, 16, 'float32x4')] };
 const ibPart = { arrayStride: PSTR * 4, stepMode: 'instance', attributes: [A(0, 0, 'float32x4'), A(1, 16, 'float32')] };
 const ibSnow = { arrayStride: 16, stepMode: 'instance', attributes: [A(0, 0, 'float32x4')] };
@@ -119,6 +121,15 @@ const pSnow = scenePipe(mSpr, 'vsSnow', 'fsSnow', [ibSnow], { strip: true, blend
 const pPl = scenePipe(mSpr, 'vsPl', 'fsPl', [ibSnow], { strip: true, blend: ADD });
 const pGl = scenePipe(mLeaf, 'vsGl', 'fsGl', [ibBub], { strip: true, blend: ADD, constants: { ROWS: 7 } });
 const pGlass = scenePipe(mGlass, 'vs', 'fs', [], { blend: PRE });
+// High, Medium: the near walls and the surface from above refract a copy of the resolved scene in a second pass
+const GLASS = LV < 2;
+const bglB = GLASS && device.createBindGroupLayout({ entries: [{ binding: 0, visibility: SS.FRAGMENT, texture: {} },
+  { binding: 1, visibility: SS.FRAGMENT, texture: { sampleType: 'depth', multisampled: true } }] });
+const glassPipe = (m, vsE, fsE, strip) => device.createRenderPipeline({ layout: device.createPipelineLayout({ bindGroupLayouts: [bgl0, bglB] }),
+  vertex: { module: m, entryPoint: vsE }, fragment: { module: m, entryPoint: fsE, targets: [{ format: HDR, blend: PRE }] },
+  primitive: { topology: strip ? 'triangle-strip' : 'triangle-list' } });
+let pGlassA, pNear, pTopB;
+if (GLASS) { const m = mod(W_GLASSB); pGlassA = scenePipe(mGlass, 'vs', 'fs', [], { blend: PRE, constants: { SPLIT: 1 } }); pNear = glassPipe(m, 'vs', 'fsNear'); pTopB = glassPipe(m, 'vsTop', 'fsTopB', true); }
 const pSolidSh = shadowPipe(mSolid, 'vs', [vbSolid, ibSolid]), pTerrSh = shadowPipe(mSolid, 'vs', [vbSolid, ibSolid], { cull: 'front' });
 const pLeafSh = shadowPipe(mLeaf, 'vs', [ibLeaf], { strip: true, constants: { ROWS: 3 } });
 
@@ -134,12 +145,30 @@ const pRB = device.createRenderPipeline({ layout: 'auto', vertex: { module: mRB,
 const pRays = device.createRenderPipeline({ layout: 'auto', vertex: { module: mRays, entryPoint: 'vs' }, fragment: { module: mRays, entryPoint: 'fs', targets: [{ format: HDR }] } });
 const pPost = device.createRenderPipeline({ layout: 'auto', vertex: { module: mPost, entryPoint: 'vs' }, fragment: { module: mPost, entryPoint: 'fs', targets: [{ format: FMT }] } });
 
-// ---------------------------------------------------------------- the lamp above the tank (fixed direction) + shadow matrix
+// ---------------------------------------------------------------- the lamp above the tank + shadow matrix
+// High, Medium: the lamp crosses the sky with the day (phase 0.15..0.85: east to west along the tank, 38..72 degrees up;
+// the dim night light takes the same arc). Low keeps the fixed direction below.
 const SUN = (() => { const v = [0.27, 1, -0.24], l = hypot(...v); return v.map((c) => c / l); })();
+// SUNC drawn now, SUNT where the day puts it, SUNB the direction of the shadow map in use, SUNK the one being baked
+const SUNC = new Float32Array(SUN), SUNT = new Float32Array(3), SUNB = new Float32Array(SUN), SUNK = new Float32Array(3), SHMS = new Float32Array(12);
+// a re-bake is spread over frames, one group of parts each (below 1 ms each on High): 1 terrain, 2 rocks, 4 chips,
+// 8 pebbles, 16 kelp, 32 << i props of kind i (sponges 0-2, coral 3-4, tube sponges 5). Medium bakes no chips and
+// props. SLICES[0]: the whole map at once (a new world).
+const SLICES = LV ? [2047, 3, 16] : [2047, 3, 4, 8, 16 | 32 | 64, 128 | 512, 256, 1024], NSL = SLICES.length - 1;
+let bakeStep = 0, bakeT = -1e9, bakeN = 0, shTank = null;
 for (let i = 0; i < 3; i++) UB[48 + i] = UBS[48 + i] = SUN[i];
 UBS[58] = 1;
-function setShadow(tank) {
-  const L = SUN, lr = [L[1], -L[0], 0], ll = hypot(...lr); lr[0] /= ll; lr[1] /= ll;
+function sunAt(ph, o) {
+  let f = (ph - 0.15) / 0.7;
+  if (f < 0 || f > 1) f = ((((ph - 0.85) % 1) + 1) % 1) / 0.3;
+  f = clamp(f, 0, 1);
+  const el = (38 + 34 * sin(PI * f)) * PI / 180, h = cos(el), a = PI * (1 - f);
+  const x = h * cos(a), y = sin(el), z = -0.45 * h, l = hypot(x, y, z);
+  o[0] = x / l; o[1] = y / l; o[2] = z / l;
+}
+// the light's view of the tank for direction L into UBS (the shadow pass's camera and g.sm)
+function setShadow(L) {
+  const tank = shTank, lr = [L[1], -L[0], 0], ll = hypot(...lr); lr[0] /= ll; lr[1] /= ll;
   const lu = [L[1] * lr[2] - L[2] * lr[1], L[2] * lr[0] - L[0] * lr[2], L[0] * lr[1] - L[1] * lr[0]];
   const c = [0, -tank.depth / 2, 0], R = hypot(tank.half_x, tank.depth / 2, tank.half_z) + 2, cl = c[0] * L[0] + c[1] * L[1] + c[2] * L[2];
   const d0 = cl - R - 2, d1 = cl + R + 2, m = UBS, dot = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
@@ -147,9 +176,26 @@ function setShadow(tank) {
   m[1] = lu[0] / R; m[5] = lu[1] / R; m[9] = lu[2] / R; m[13] = -dot(c, lu) / R;
   m[2] = -L[0] / (d1 - d0); m[6] = -L[1] / (d1 - d0); m[10] = -L[2] / (d1 - d0); m[14] = d1 / (d1 - d0);
   m[3] = 0; m[7] = 0; m[11] = 0; m[15] = 1;
-  for (let i = 0; i < 16; i++) { UBS[16 + i] = m[i]; UB[16 + i] = m[i]; }
+  for (let i = 0; i < 16; i++) UBS[16 + i] = m[i];
   UBS[32] = 0; UBS[33] = -tank.depth / 2; UBS[34] = 0; UBS[35] = 0;
+  for (let i = 0; i < 3; i++) UBS[48 + i] = L[i];
   Q.writeBuffer(uboS, 0, UBS);
+}
+// follow the day; once the lamp is more than 3 degrees from the shadow map's direction (and the last re-bake is 2 s
+// old) bake the other map over the next NSL frames, then swap (render)
+function updateSun(dt) {
+  if (!MOVE) return;
+  const s = snN ? snap[snHead] : null, dp = nowa.debug.phase;
+  sunAt(typeof dp === 'number' ? dp : s ? s.dayPhase : 0.3, SUNT);
+  const k = 1 - exp(-dt * 0.7);
+  let l = 0;
+  for (let i = 0; i < 3; i++) { SUNC[i] += (SUNT[i] - SUNC[i]) * k; l += SUNC[i] * SUNC[i]; }
+  l = sqrt(l);
+  for (let i = 0; i < 3; i++) { SUNC[i] /= l; UB[48 + i] = SUNC[i]; }
+  const now = performance.now();
+  if (!bakeStep && WD && SUNC[0] * SUNB[0] + SUNC[1] * SUNB[1] + SUNC[2] * SUNB[2] < 0.99863 && (now - bakeT > 2000 || nowa.debug.sunFast)) {
+    SUNK.set(SUNC); setShadow(SUNK); bakeStep = 1; bakeT = now;
+  }
 }
 
 // ---------------------------------------------------------------- meshes (independent of the world)
@@ -190,7 +236,9 @@ const PARTOFF = MAXC * CSTR * 4, instB = device.createBuffer({ size: PARTOFF + M
 // for 60 fps; both start where the last visit left them.
 const PIXMAX = 2560 * 1440, PIXMIN = mob ? 25e4 : 3e5, DETMIN = 0.4;
 let W = 0, H = 0, DW = 0, DH = 0, pix = +SV[1] || (LV > 1 ? 41e4 : mob ? 1280 * 720 : PIXMAX), det = +SV[2] || 1, dynN = 0, dynT = 0, dynG = 0, dynGN = 0, dynBad = 0, dynOk = 0, dynWait = 3;
-let passScene, passRays, passBlur, bgBlur, passPost, bgRays, bgPost, bloomPass = [], bloomBG = [], targets = [], vDp, vRes, vRay, vRay2, vBl;
+let passScene, passRays, passBlur, bgBlur, passPost, bgRays, bgRaysX, bgPost, bloomPass = [], bloomBG = [], targets = [], vDp, vRes, vRay, vRay2, vBl;
+const cpSrc = { texture: null }, cpDst = { texture: null };
+let tCopyT, passGlass, bgGlass, glassSz;
 const NB = 6;
 function resize() {
   DW = max(2, round(canvas.clientWidth * devicePixelRatio)); DH = max(2, round(canvas.clientHeight * devicePixelRatio));
@@ -202,11 +250,15 @@ function resize() {
   ctx.configure({ device, format: FMT, alphaMode: 'opaque' });
   for (const t of targets) t.destroy();
   const tMS = tex(AA > 1 ? W : 1, H, HDR, TU.RENDER_ATTACHMENT, { samples: AA }), tDp = tex(W, H, DEPTH, TU.RENDER_ATTACHMENT | TU.TEXTURE_BINDING, { samples: AA });
-  const tRes = tex(W, H, HDR, TU.RENDER_ATTACHMENT | TU.TEXTURE_BINDING), tRay = tex(W / 2, H / 2, HDR, TU.RENDER_ATTACHMENT | TU.TEXTURE_BINDING), tRay2 = tex(W / 2, H / 2, HDR, TU.RENDER_ATTACHMENT | TU.TEXTURE_BINDING);
+  const tRes = tex(W, H, HDR, TU.RENDER_ATTACHMENT | TU.TEXTURE_BINDING | (GLASS ? TU.COPY_SRC : 0)), tRay = tex(W / 2, H / 2, HDR, TU.RENDER_ATTACHMENT | TU.TEXTURE_BINDING), tRay2 = tex(W / 2, H / 2, HDR, TU.RENDER_ATTACHMENT | TU.TEXTURE_BINDING);
   targets = [tMS, tDp, tRes, tRay, tRay2];
   const bl = [];
   for (let i = 0; i < NB; i++) { const t = tex(max(1, W >> (i + 1)), max(1, H >> (i + 1)), HDR, TU.RENDER_ATTACHMENT | TU.TEXTURE_BINDING); bl.push(t); targets.push(t); }
   vDp = tDp.createView(); vRes = tRes.createView(); vRay = tRay.createView(); vRay2 = tRay2.createView(); vBl = bl.map((t) => t.createView());
+  if (GLASS) {
+    tCopyT = tex(W, H, HDR, TU.TEXTURE_BINDING | TU.COPY_DST); targets.push(tCopyT); glassSz = [W, H]; cpSrc.texture = tRes; cpDst.texture = tCopyT;
+    passGlass = { colorAttachments: [{ view: vRes, loadOp: 'load', storeOp: 'store' }] };
+  }
   // without anti-aliasing (Low) the scene goes straight into the resolve target, and tMS is one unused column
   passScene = { colorAttachments: [{ view: AA > 1 ? tMS.createView() : vRes, resolveTarget: AA > 1 ? vRes : undefined, loadOp: 'clear', storeOp: AA > 1 ? 'discard' : 'store', clearValue: [0, 0, 0, 1] }],
     depthStencilAttachment: { view: vDp, depthClearValue: 0, depthLoadOp: 'clear', depthStoreOp: 'store' } };
@@ -222,8 +274,10 @@ function resize() {
 // bind groups that read the render targets or the world's volume texture
 function mkRT() {
   bgBlur = device.createBindGroup({ layout: pRB.getBindGroupLayout(0), entries: [{ binding: 0, resource: vRay }] });
-  bgRays = device.createBindGroup({ layout: pRays.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: ubo } }, { binding: 1, resource: sRep }, { binding: 2, resource: sCmp },
-    { binding: 3, resource: tShadow.createView() }, { binding: 4, resource: tWater.createView() }, { binding: 5, resource: vDp }, { binding: 6, resource: tVol.createView() }, { binding: 7, resource: sClamp }] });
+  const raysBG = (tSh) => device.createBindGroup({ layout: pRays.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: ubo } }, { binding: 1, resource: sRep }, { binding: 2, resource: sCmp },
+    { binding: 3, resource: tSh.createView() }, { binding: 4, resource: tWater.createView() }, { binding: 5, resource: vDp }, { binding: 6, resource: tVol.createView() }, { binding: 7, resource: sClamp }] });
+  if (GLASS) bgGlass = device.createBindGroup({ layout: bglB, entries: [{ binding: 0, resource: tCopyT.createView() }, { binding: 1, resource: vDp }] });
+  bgRays = raysBG(shIdx ? tShadow2 : tShadow); if (MOVE) bgRaysX = raysBG(shIdx ? tShadow : tShadow2);
   bgPost = device.createBindGroup({ layout: pPost.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: ubo } }, { binding: 1, resource: sClamp }, { binding: 2, resource: vRes },
     { binding: 3, resource: vRay2 }, { binding: 4, resource: vBl[0] }, { binding: 5, resource: vDp }] });
   // down: res -> b0 -> ... -> b5 ; up: b5 -> b4 (additive) ... -> b0
@@ -231,7 +285,30 @@ function mkRT() {
   for (let i = 0; i < NB; i++) bloomBG.push(blitBG(i ? vBl[i - 1] : vRes));
   for (let i = NB - 1; i > 0; i--) bloomBG.push(blitBG(vBl[i]));
 }
-function mkBG() { bg0 = mkBG0(ubo, tShadow); bg0s = mkBG0(uboS, tDummy); if (W) mkRT(); }
+function mkBG() {
+  bg0 = mkBG0(ubo, shIdx ? tShadow2 : tShadow); if (MOVE) bg0x = mkBG0(ubo, shIdx ? tShadow : tShadow2);
+  bg0s = mkBG0(uboS, tDummy); if (W) mkRT();
+}
+// the shadow map, whole (st 0) or one slice of a re-bake (1..NSL), into map k (0 tShadow, 1 tShadow2)
+const shView = [tShadow.createView(), MOVE ? tShadow2.createView() : null];
+const shDesc = [0, 1].map((k) => [0, 1].map((ld) => ({ colorAttachments: [], depthStencilAttachment: { view: shView[k], depthClearValue: 1, depthLoadOp: ld ? 'load' : 'clear', depthStoreOp: 'store' } })));
+function shadowSlice(e, st, k, ts) {
+  const Wd = WD, d = shDesc[k][st > 1 ? 1 : 0], m = SLICES[st];
+  d.timestampWrites = ts;
+  const r = e.beginRenderPass(d);
+  r.setBindGroup(0, bg0s);
+  if (m & 1) {
+    r.setPipeline(pTerrSh); r.setVertexBuffer(0, Wd.vbTerrain); r.setVertexBuffer(1, Wd.ibSolids); r.setIndexBuffer(Wd.ibTerrain, 'uint32');
+    r.drawIndexed(Wd.T.ni, 1, 0, 0, Wd.nSolid);
+  }
+  r.setPipeline(pSolidSh); r.setVertexBuffer(0, vbMesh); r.setIndexBuffer(ibMesh, 'uint32');
+  if (m & 2) { r.setVertexBuffer(1, Wd.ibSolids); for (let i = 0; i < 4; i++) { const g = Wd.solids.ranges[i]; if (g[1]) r.drawIndexed(meshes[i].ib.length, g[1], meshes[i].i0, meshes[i].v0, g[0]); } }
+  if ((m & 12) && !LV) for (let i = m & 4 ? 0 : 6; i < (m & 8 ? NCHUNK : 6); i++) if (Wd.chunks[i].n) { r.setVertexBuffer(1, Wd.ibChunk[i]); r.drawIndexed(meshes[CH + i].ib.length, Wd.chunks[i].n, meshes[CH + i].i0, meshes[CH + i].v0, 0); }
+  // coral casts its shadow with the coarser mesh it is drawn with past 8 m
+  if (!LV) for (let i = 0; i < 6; i++) if ((m & (32 << i)) && Wd.props[i].n) { const me = meshes[i === 3 || i === 4 ? PRL + i : 4 + i]; r.setVertexBuffer(1, Wd.ibProp[i]); r.drawIndexed(me.ib.length, Wd.props[i].n, me.i0, me.v0, 0); }
+  if ((m & 16) && Wd.big.n) { r.setPipeline(pLeafSh); r.setVertexBuffer(0, Wd.ibBig); r.draw(6, Wd.big.n); }
+  r.end();
+}
 mkBG();
 resize();
 addEventListener('resize', resize);
@@ -254,21 +331,27 @@ function uploadPlankton() {
 }
 
 // ---------------------------------------------------------------- timing (GPU timestamp queries)
-let qs, qResolve, qRead = [], tsBegin, tsEnd;
+// 0 frame start, 1 frame end; 2 scene pass end, 3 glass pass end (the copy and the glass pass); 4, 5 a shadow slice
+let qs, qResolve, qRead = [], tsBegin, tsEnd, tsScene, tsGlass, tsShadow, benchG = 0, benchN = 0, benchGl = 0, benchGlN = 0;
 if (hasTS) {
-  qs = device.createQuerySet({ type: 'timestamp', count: 2 });
-  qResolve = device.createBuffer({ size: 16, usage: BU.QUERY_RESOLVE | BU.COPY_SRC });
+  qs = device.createQuerySet({ type: 'timestamp', count: 6 });
+  qResolve = device.createBuffer({ size: 48, usage: BU.QUERY_RESOLVE | BU.COPY_SRC });
   for (let i = 0; i < 6; i++) {
-    const b = device.createBuffer({ size: 16, usage: BU.MAP_READ | BU.COPY_DST });
-    const o = { b, busy: false, done: null };
+    const b = device.createBuffer({ size: 48, usage: BU.MAP_READ | BU.COPY_DST });
+    const o = { b, busy: false, done: null, gl: false, sh: 0 };
     o.done = () => {
       const a = new BigInt64Array(b.getMappedRange());
-      const ms = Number(a[1] - a[0]) / 1e6; F[GPU] = ms; b.unmap(); o.busy = false;
+      const ms = Number(a[1] - a[0]) / 1e6; F[GPU] = ms; benchG += ms; benchN++;
+      if (o.gl) { benchGl += Number(a[3] - a[2]) / 1e6; benchGlN++; }
+      if (o.sh) SHMS[o.sh - 1] = Number(a[5] - a[4]) / 1e6;
+      b.unmap(); o.busy = false;
       if (dynT > 0 && ms > 0 && ms < 1e3) { dynG += ms; dynGN++; }
     };
     qRead.push(o);
   }
   tsBegin = { querySet: qs, beginningOfPassWriteIndex: 0 }; tsEnd = { querySet: qs, endOfPassWriteIndex: 1 };
+  tsScene = { querySet: qs, endOfPassWriteIndex: 2 }; tsGlass = { querySet: qs, endOfPassWriteIndex: 3 };
+  tsShadow = { querySet: qs, beginningOfPassWriteIndex: 4, endOfPassWriteIndex: 5 };
 }
 
 // ---------------------------------------------------------------- the world, built from `hello` + the floor frame
@@ -280,7 +363,7 @@ async function buildWorld(job) {
   WD = null; body.className = 'l'; $('m').style.display = ''; $('b').getAnimations().forEach((a) => a.cancel()); loaded = 0;
   await say(TXT.sculpt, 0.2, 700);
   keep(LKEY, 1); // marks a load in progress (quality.js); leaving the page before it ends is not a crash
-  setGrid(tank); setTankCamera(tank);
+  setGrid(tank); setTankCamera(tank); directorSetup(tank);
   // density bake on the GPU, in slabs of 32 z-layers (short GPU jobs), read back once
   const nPos = (tank.positives || []).length, nHole = (tank.holes || []).length;
   const m = mod(W_DENS), p = device.createComputePipeline({ layout: 'auto', compute: { module: m, entryPoint: 'main' } });
@@ -328,30 +411,21 @@ async function buildWorld(job) {
   const PW = [tank.half_x, tank.depth, tank.half_z, 1.2, 0, 0, 0, 0, 0, 0, 0, 0, OX, OY, OZ, FOGK, 1 / (NX * VS), 1 / (NY * VS), 1 / (NZ * VS), 1,
     gr ? gr.c[0] : 0, gr ? gr.c[1] : -1e3, gr ? gr.c[2] : 0, gr ? gr.r : 0];
   for (let i = 0; i < 24; i++) if (i < 4 || i >= 12) UB[60 + i] = UBS[60 + i] = PW[i];
-  setShadow(tank);
+  shTank = tank;
+  if (MOVE) { const s = snN ? snap[snHead] : null; sunAt(typeof nowa.debug.phase === 'number' ? nowa.debug.phase : s ? s.dayPhase : 0.3, SUNC); }
+  SUNB.set(SUNC); bakeStep = 0; setShadow(SUNC);
+  for (let i = 0; i < 16; i++) UB[16 + i] = UBS[16 + i];
+  for (let i = 0; i < 3; i++) UB[48 + i] = SUNC[i];
   mkBG();
   oVol.destroy(); oMap.destroy();
-  // shadow map: terrain, rocks, (High: chips and props), kelp
-  {
-    const e = device.createCommandEncoder();
-    const r = e.beginRenderPass({ colorAttachments: [], depthStencilAttachment: { view: tShadow.createView(), depthClearValue: 1, depthLoadOp: 'clear', depthStoreOp: 'store' } });
-    r.setBindGroup(0, bg0s);
-    r.setPipeline(pTerrSh); r.setVertexBuffer(0, vbTerrain); r.setVertexBuffer(1, ibSolids); r.setIndexBuffer(ibTerrain, 'uint32');
-    r.drawIndexed(T.ib.length, 1, 0, 0, nSolid);
-    r.setPipeline(pSolidSh); r.setVertexBuffer(0, vbMesh); r.setIndexBuffer(ibMesh, 'uint32');
-    for (let i = 0; i < 4; i++) { const g = Wd.solids.ranges[i]; if (g[1]) r.drawIndexed(meshes[i].ib.length, g[1], meshes[i].i0, meshes[i].v0, g[0]); }
-    if (!LV) for (let i = 0; i < NCHUNK; i++) if (Wd.chunks[i].n) { r.setVertexBuffer(1, ibChunk[i]); r.drawIndexed(meshes[CH + i].ib.length, Wd.chunks[i].n, meshes[CH + i].i0, meshes[CH + i].v0, 0); }
-    if (!LV) for (let i = 0; i < 6; i++) if (Wd.props[i].n) { r.setVertexBuffer(1, ibProp[i]); r.drawIndexed(meshes[4 + i].ib.length, Wd.props[i].n, meshes[4 + i].i0, meshes[4 + i].v0, 0); }
-    if (Wd.big.n) { r.setPipeline(pLeafSh); r.setVertexBuffer(0, ibBig); r.draw(6, Wd.big.n); }
-    r.end();
-    Q.submit([e.finish()]);
-  }
   if (old) for (const b of old.res) b.destroy();
-  CG = cg;
+  CG = cg; KELP = Wd.kelp;
   WD = { T: { start: T.start, lo: T.lo, hi: T.hi, ni: T.ib.length, nv: T.nv }, chunks: Wd.chunks, props: Wd.props, big: Wd.big, bigF: Wd.bigF, small: Wd.small, solids: Wd.solids,
     nSolid, vbTerrain, ibTerrain, ibSolids, ibChunk, ibProp, ibBig, ibBigF, ibSmall, ibBubbles, ibSnowB, ibGl, ibPl,
     nBub: Wd.bubbles.length / 8, nSnow: Wd.snow.length / 4, nGl: Wd.glints.length / 8, nPl: Wd.plank.length / 4, res };
   for (const o of [Wd.big, Wd.bigF, Wd.small, ...Wd.chunks, ...Wd.props]) o.buf = o.data = 0;
+  // shadow map: terrain, rocks, (High: chips and props), kelp
+  { const e = device.createCommandEncoder(); shadowSlice(e, 0, shIdx); Q.submit([e.finish()]); }
   if (!urlDone) { urlDone = true; applyUrl(); }
   await say(TXT.light, 1, 400);
   // the first frame compiles the pipelines; wait for it (not forever: a hidden tab may not run the GPU queue)
@@ -432,6 +506,8 @@ function render() {
   // exposure: brighter down in the water and at night (the eye adapts); from the room a fixed middle value
   let ek = cy < 0 && abs(cx) < m[60] && abs(cz) < m[62] ? (-cy - 5) / 22 : 0.45; ek = ek < 0 ? 0 : ek > 1 ? 1 : ek;
   m[56] = EXPO * (0.6 + 0.4 * ek) * (1 + 0.9 * nightS); m[57] = RAYS * pow(lightS, 1.3); m[58] = det;
+  // the last slice of a shadow re-bake goes out this frame: the scene already samples the new map with its matrix
+  if (bakeStep === NSL) for (let i = 0; i < 16; i++) m[16 + i] = UBS[16 + i];
   Q.writeBuffer(ubo, 0, UB);
   WT[0] = F[TIME]; Q.writeBuffer(uboW, 0, WT);
   if (nCre) Q.writeBuffer(instB, 0, CI, 0, nCre * CSTR);
@@ -446,7 +522,19 @@ function render() {
   // animated water texture + mips
   let r = e.beginRenderPass(waterPass[0]); r.setPipeline(pWater); r.setBindGroup(0, bgWater); r.draw(3); r.end();
   for (let i = 1; i < 5; i++) { r = e.beginRenderPass(waterPass[i]); r.setPipeline(pMip16); r.setBindGroup(0, waterBG[i - 1]); r.draw(3); r.end(); }
+  // shadow re-bake: one slice into the map not in use; after the last, swap the maps
+  if (slot) slot.sh = bakeStep;
+  if (bakeStep) {
+    shadowSlice(e, bakeStep, shIdx ^ 1, slot ? tsShadow : undefined);
+    if (bakeStep === NSL) {
+      let t = bg0; bg0 = bg0x; bg0x = t; t = bgRays; bgRays = bgRaysX; bgRaysX = t;
+      shIdx ^= 1; SUNB.set(SUNK); bakeStep = 0; bakeN++;
+    } else bakeStep++;
+  }
   // scene
+  // High, Medium with the camera out of the water: the near walls and the surface from above go to the glass pass
+  const gB = GLASS && nowa.debug.glass !== false && (cy >= 0 || abs(cx) > UB[60] || abs(cz) > UB[62]);
+  passScene.timestampWrites = slot && gB ? tsScene : undefined;
   r = e.beginRenderPass(passScene);
   r.setBindGroup(0, bg0);
   r.setPipeline(pTerrain); r.setVertexBuffer(0, Wd.vbTerrain); r.setVertexBuffer(1, Wd.ibSolids); r.setIndexBuffer(Wd.ibTerrain, 'uint32');
@@ -484,9 +572,17 @@ function render() {
   r.setPipeline(pGl); r.setVertexBuffer(0, Wd.ibGl); r.draw(4, Wd.nGl);
   r.setPipeline(pSnow); r.setVertexBuffer(0, Wd.ibSnowB); r.draw(4, Wd.nSnow);
   r.setPipeline(pPl); r.setVertexBuffer(0, Wd.ibPl); r.draw(4, Wd.nPl);
-  if (cy >= 0) { r.setPipeline(pSurfTop); r.draw(4); }
-  r.setPipeline(pGlass); r.draw(24);
+  if (cy >= 0 && !gB) { r.setPipeline(pSurfTop); r.draw(4); }
+  r.setPipeline(gB ? pGlassA : pGlass); r.draw(24);
   r.end();
+  if (gB) {
+    passGlass.timestampWrites = slot ? tsGlass : undefined;
+    e.copyTextureToTexture(cpSrc, cpDst, glassSz);
+    r = e.beginRenderPass(passGlass); r.setBindGroup(0, bg0); r.setBindGroup(1, bgGlass);
+    if (cy >= 0) { r.setPipeline(pTopB); r.draw(4); }
+    r.setPipeline(pNear); r.draw(24);
+    r.end();
+  }
   // light shafts
   r = e.beginRenderPass(passRays); r.setPipeline(pRays); r.setBindGroup(0, bgRays); r.draw(3); r.end();
   r = e.beginRenderPass(passBlur); r.setPipeline(pRB); r.setBindGroup(0, bgBlur); r.draw(3); r.end();
@@ -497,7 +593,7 @@ function render() {
   // composite
   passPost.colorAttachments[0].view = ctx.getCurrentTexture().createView();
   r = e.beginRenderPass(passPost); r.setPipeline(pPost); r.setBindGroup(0, bgPost); r.draw(3); r.end();
-  if (slot) { e.resolveQuerySet(qs, 0, 2, qResolve, 0); e.copyBufferToBuffer(qResolve, 0, slot.b, 0, 16); }
+  if (slot) { slot.gl = gB; e.resolveQuerySet(qs, 0, 6, qResolve, 0); e.copyBufferToBuffer(qResolve, 0, slot.b, 0, 48); }
   submitList[0] = e.finish();
   Q.submit(submitList);
   if (slot) { slot.busy = true; slot.b.mapAsync(GPUMapMode.READ).then(slot.done, noop); }
@@ -505,11 +601,12 @@ function render() {
 
 function frame(now) {
   requestAnimationFrame(frame);
+  if (!WD) { F[LAST] = now; return; }
+  // turbo: the server runs flat out and sends five frames a second; draw at most about 30 times a second. A skipped
+  // frame leaves F[LAST] alone, so the next drawn one advances the animation, the camera and the director by all of it
+  if (snN && (snap[snHead].flags & 2)) { if (now - lastDraw < 30) return; dynT = -300; }
   const dtr = now - F[LAST]; F[LAST] = now;
   let dt = dtr / 1000; if (dt > 0.1) dt = 0.1;
-  if (!WD) return;
-  // turbo: the server sends two frames a second and runs flat out; draw about four times a second
-  if (snN && (snap[snHead].flags & 2)) { if (now - lastDraw < 250) return; dynT = -300; }
   lastDraw = now;
   // Dynamic resolution for 60 fps: every second scale the load by k
   if (dtr < 1e3 && (dynT += dtr) > 0 && (dynN++, dynT > 1000)) {
@@ -531,7 +628,7 @@ function frame(now) {
   }
   F[TIME] += dt;
   const c0 = performance.now();
-  updateLight(dt);
+  updateLight(dt); updateSun(dt);
   updateCreatures(now, dt);
   updateCamera(dt);
   render();
@@ -563,11 +660,39 @@ const nowa = window.nowa = {
   },
   // debug.light: a number 0..1 overrides the stream's light level; debug.settle(s): advance the camera and creature
   // smoothing by s seconds in 1/60 s steps and draw once (for screenshots from a throttled, hidden browser tab)
-  debug: { light: null, audio: () => (AC ? AC.state : 'none') + (muted ? ', muted' : ''),
+  debug: { light: null,
+    // interpolation: frame interval and delay (ms); where creature `id` is drawn at time `now` (advances the swim state)
+    // draws a frame and returns it as a JPEG Blob of w x h (the 3D scene only, without the HTML HUD)
+    capture(w = 1600, h = 900, q = 0.86) { render(); const c = document.createElement('canvas'); c.width = w; c.height = h; c.getContext('2d').drawImage(canvas, 0, 0, w, h); return new Promise((r) => c.toBlob(r, 'image/jpeg', q)); },
+    interp: () => ({ perMs: +snPer.toFixed(1), delayMs: +snDelay.toFixed(1) }),
+    // where creature id is on screen now (CSS px of the canvas), or null (for synthetic clicks and taps in tests)
+    screenOf(id) {
+      const t = trackOf(id); if (t < 0) return null;
+      const x = tkP[t * 3], y = tkP[t * 3 + 1], z = tkP[t * 3 + 2], M = UB, w = M[3] * x + M[7] * y + M[11] * z + M[15];
+      if (w <= 0.05) return null;
+      const r = canvas.getBoundingClientRect();
+      return [r.left + ((M[0] * x + M[4] * y + M[8] * z + M[12]) / w * 0.5 + 0.5) * r.width, r.top + (0.5 - (M[1] * x + M[5] * y + M[9] * z + M[13]) / w * 0.5) * r.height];
+    },
+    trackAt(id, now) { updateCreatures(now, 1 / 60); const t = trackOf(id); return t < 0 ? null : [tkP[t * 3], tkP[t * 3 + 1], tkP[t * 3 + 2]]; },
+    director: () => ({ shot: ['orbit', 'glide', 'grotto', 'follow'][DS[S_KIND]], t: +DS[S_T].toFixed(1), dur: +DS[S_DUR].toFixed(1), subject: dirSubj || null, shots: DS[S_N], candidate: candId || null, score: +candScore.toFixed(1), caption: HS.el.hcap ? HS.el.hcap.textContent : '', blocked: dirSubj && trackOf(dirSubj) >= 0 ? rockBetween(F[DX], F[DY], F[DZ], tkP[trackOf(dirSubj) * 3], tkP[trackOf(dirSubj) * 3 + 1], tkP[trackOf(dirSubj) * 3 + 2], 0.4, true) : null }), audio: () => (AC ? AC.state : 'none') + (muted ? ', muted' : ''),
+    // the lamp: where it is drawn, the shadow map's direction, re-bakes so far and the GPU ms of the last slices
+    sun: () => ({ dir: [...SUNC].map((v) => +v.toFixed(3)), shadowDir: [...SUNB].map((v) => +v.toFixed(3)), baking: bakeStep, bakes: bakeN, sliceMs: [...SHMS].map((v) => +v.toFixed(2)) }),
     counts() { return WD && { terrainVerts: WD.T.nv, terrainTris: WD.T.ni / 3, leaves: WD.big.n, smallLeaves: WD.small.n, props: WD.props.map((p) => p.n), chips: WD.chunks.map((c) => c.n), rocks: WD.nSolid, glints: WD.nGl, bubbles: WD.nBub, grid: [NX, NY, NZ, VS] }; },
     // CPU time of n frames (update + encode) and the wall time until the GPU has finished them
-    async bench(n = 30) { const t0 = performance.now(); let cpu = 0; for (let i = 0; i < n; i++) { const c = performance.now(); updateCreatures(c, 1 / 60); updateCamera(1 / 60); render(); cpu += performance.now() - c; } await Q.onSubmittedWorkDone(); return { cpuMs: cpu / n, wallMs: (performance.now() - t0) / n, gpuMs: F[GPU], res: [W, H] }; },
-    settle(s = 2) { if (!WD) return; const now = performance.now(); for (let t = 0; t < s; t += 1 / 60) { updateLight(1 / 60); updateCreatures(now, 1 / 60); updateCamera(1 / 60); } render(); } },
+    // px: render that many pixels for the run (the dynamic resolution is paused); gpuMs is the mean over the frames
+    async bench(n = 30, px = 0) {
+      const p0 = pix; if (px) { pix = px; W = 0; resize(); }
+      dynT = -1e9; benchG = benchN = benchGl = benchGlN = 0;
+      const t0 = performance.now(); let cpu = 0;
+      for (let i = 0; i < n; i++) {
+        const c = performance.now(); updateCreatures(c, 1 / 60); updateCamera(1 / 60); render(); cpu += performance.now() - c;
+        await Q.onSubmittedWorkDone(); await new Promise((r) => setTimeout(r, 0));
+      }
+      const o = { cpuMs: cpu / n, wallMs: (performance.now() - t0) / n, gpuMs: benchN ? benchG / benchN : F[GPU], glassMs: benchGlN ? benchGl / benchGlN : 0, timed: benchN, res: [W, H] };
+      if (px) { pix = p0; W = 0; resize(); }
+      dynT = -300; return o;
+    },
+    settle(s = 2) { if (!WD) return; const now = performance.now(); for (let t = 0; t < s; t += 1 / 60) { updateLight(1 / 60); updateSun(1 / 60); updateCreatures(now, 1 / 60); updateCamera(1 / 60); } render(); } },
   get lang() { return LANG; },
   setLang,
   ready: false,

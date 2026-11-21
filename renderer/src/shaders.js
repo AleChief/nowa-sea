@@ -286,21 +286,38 @@ fn fog(c: vec3f, wp: vec3f, z: f32) -> vec3f {
   return c * exp(-sg(z) * L) + fogIn(ro, rd, L, z, g.sun.xyz) * (.58 + .42 * vol(ro + rd * L).g);
 }
 fn qrot(q: vec4f, v: vec3f) -> vec3f { return v + 2. * cross(q.xyz, cross(q.xyz, v) + q.w * v); }
-// the dark room around the tank: walls, a floor 7 m below the glass bottom lit by the tank, a black cabinet
+// the dark room around the tank: walls with a soft band of tank light, a floor 7 m below the glass bottom lit by
+// the tank, the black stand under it, a dim ceiling and the lamp's glow towards the light
 fn roomCol(ro: vec3f, rd: vec3f) -> vec3f {
-  let fy = -g.box.y - 7.;
-  var c = vec3f(.012, .015, .02) * (1. - .6 * sat(abs(rd.y)));
-  if (rd.y < -1e-3) {
-    let p = ro + rd * ((fy - ro.y) / rd.y);
-    let q = max(abs(p.xz) - g.box.xz, vec2f(0.));
-    c = vec3f(.008, .009, .01) + vec3f(.03, .07, .09) * exp(-dot(q, q) / 120.) * (.25 + .75 * g.env.x);
+  let fy = -g.box.y - 7.; let rh = vec3f(g.box.x + 45., g.box.w + 40., g.box.z + 45.);
+  let iv = 1. / select(rd, vec3f(1e-6), abs(rd) < vec3f(1e-6));
+  let tw = (select(vec3f(-rh.x, fy, -rh.z), rh, rd > vec3f(0.)) - ro) * iv;
+  let t = min(min(tw.x, tw.y), tw.z);
+  let p = ro + rd * t;
+  let tl = .25 + .75 * g.env.x;
+  var c: vec3f;
+  if (tw.y <= min(tw.x, tw.z)) {
+    if (rd.y < 0.) {
+      let q = max(abs(p.xz) - g.box.xz, vec2f(0.));
+      c = vec3f(.008, .009, .01) + vec3f(.03, .07, .09) * exp(-dot(q, q) / 120.) * tl;
+    } else { c = vec3f(.004, .005, .007) + vec3f(.006, .012, .016) * exp(-dot(p.xz, p.xz) / 3000.) * tl; }
+  } else {
+    let h = (p.y + g.box.y * .5) / (g.box.y + 25.);
+    let u = min(abs(p.x) / rh.x, abs(p.z) / rh.z);
+    c = (vec3f(.009, .011, .015) * (1.15 - .55 * sat(h)) + vec3f(.012, .03, .04) * exp(-h * h * 4.) * tl) * (1. - .55 * u * u);
   }
   let cb = bseg(ro, rd, vec3f(-g.box.x - .5, fy, -g.box.z - .5), vec3f(g.box.x + .5, -g.box.y, g.box.z + .5), 1e5);
   if (cb.y > cb.x) {
-    let p = ro + rd * cb.x;
-    c = vec3f(.006, .006, .007) + vec3f(.02, .05, .06) * ss(-g.box.y - .3, -g.box.y, p.y) * (.3 + .7 * g.env.x);
+    let q = ro + rd * cb.x;
+    let seam = ss(.12, .04, abs(fract((q.x + q.z) / 16.) - .5) * 16.) * step(fy + .3, q.y);
+    c = vec3f(.006, .006, .007) * (1. - .4 * seam) + vec3f(.02, .05, .06) * ss(-g.box.y - .3, -g.box.y, q.y) * (.3 + .7 * g.env.x);
   }
-  return c;
+  let mu = sat(dot(rd, g.sun.xyz));
+  return c + g.sunc.rgb * (pow(mu, 3000.) * 3. + pow(mu, 80.) * .03) * step(0., rd.y);
+}
+fn ripple(p: vec2f, d: f32) -> vec2f {
+  let fl = ss(260., 60., d);
+  return (textureSample(tW, sR, p / 13.).ba + textureSample(tW, sR, p.yx / 4.7 + .2).ba * .7 + textureSample(tW, sR, p / 37. + .6).ba * .8) * fl;
 }
 `;
 
@@ -527,10 +544,10 @@ struct GO { @builtin(position) cp: vec4f, @location(0) uv: vec2f, @location(1) @
 // One module, one pipeline per body plan (MESH): 0 fish (sparkfin), 1 ray (sweeper), 2 needle (needlejaw), 3 shark
 // (shade), 4 jelly (lumen, blended). Meshes are built with +x forward, +y up, length (jelly: bell diameter) 1.
 // Instance (80 bytes): a = position, size (m) | b = forward, swim phase (cycles) | c = up, glow |
-// d = species index, flags, bend, fade-in | e = seed, speed / cruise, lying flat, 0
+// d = species index, flags, bend, fade-in | e = seed, speed / cruise, lying flat, 0 | f = burst amplitude, C-flex, 0, 0
 const W_CRE = S_B + /*wgsl*/`
 override MESH: u32 = 0u;
-struct VI { @location(0) p: vec3f, @location(1) n: vec4f, @location(2) a: vec4f, @location(3) b: vec4f, @location(4) c: vec4f, @location(5) d: vec4f, @location(6) e: vec4f };
+struct VI { @location(0) p: vec3f, @location(1) n: vec4f, @location(2) a: vec4f, @location(3) b: vec4f, @location(4) c: vec4f, @location(5) d: vec4f, @location(6) e: vec4f, @location(7) f: vec4f };
 struct VO { @builtin(position) cp: vec4f, @location(0) wp: vec3f, @location(1) n: vec3f, @location(2) op: vec3f,
   @location(3) @interpolate(flat) s: vec4f, @location(4) @interpolate(flat) x: vec4f, @location(5) lt: f32, @location(6) ax: f32 };
 @vertex fn vs(i: VI) -> VO {
@@ -545,7 +562,7 @@ struct VO { @builtin(position) cp: vec4f, @location(0) wp: vec3f, @location(1) n
     // ray: a wave runs out along the wings; still while it lies flat on the floor
     let mv = 1. - i.e.z; let au = abs(ax);
     let fp = ph - au * 1.2;
-    l.y += (.18 * pow(au, 1.6) * sin(fp) - .03 * sin(ph)) * mv;
+    l.y += (.18 * pow(au, 1.6) * sin(fp) - .03 * sin(ph)) * mv * (1. + .8 * i.f.x);
     let tail = ss(-.25, -.95, l.x) * step(au, .001);
     l.z += tail * sin(ph * .7 + l.x * 4.) * .05;
     let sl = (.288 * pow(au, .6) * sin(fp) - .216 * pow(au, 1.6) * cos(fp)) * sign(ax) * mv;
@@ -568,12 +585,14 @@ struct VO { @builtin(position) cp: vec4f, @location(0) wp: vec3f, @location(1) n
     var A = .075; var K = 7.; var w0 = .3;
     if (MESH == 2u) { A = .045; K = 9.; w0 = .2; }
     if (MESH == 3u) { A = .06; K = 5.5; w0 = .12; }
-    A *= .3 + .7 * spd;
+    // a burst: wider tail sweeps and a C-flex of the whole body at its onset
+    A *= (.3 + .7 * spd) * (1. + 1.6 * i.f.x);
     let w = pow(sat((w0 - l.x) / (w0 + .55)), 1.5);
     let wv = ph - l.x * K;
     var f = A * w * sin(wv); var fx = -A * w * K * cos(wv);
     // needlejaw coiled into an S before a strike
     if (MESH == 2u) { let b = i.d.z * .06; f += b * sin(l.x * 6.5); fx += b * 6.5 * cos(l.x * 6.5); }
+    let cq = l.x - .12; f += i.f.y * .26 * cq * cq; fx += i.f.y * .52 * cq;
     l.z += f; n.x -= fx * n.z;
     l.x += bite * .035 * sat((l.x - .15) * 4.);
   }
@@ -631,14 +650,14 @@ struct VO { @builtin(position) cp: vec4f, @location(0) wp: vec3f, @location(1) n
   let V = normalize(g.cam.xyz - i.wp); let z = zone(i.wp);
   let si = u32(i.s.y + .5) * 2u; let col = SPC[si].rgb; let gc = SPC[si + 1u].rgb;
   let fl = u32(i.s.z + .5); let sel = f32((fl >> 4u) & 1u);
-  let gi = i.s.x * g.env.w;
+  let gi = min(i.s.x * mix(1., g.env.w, .3), 1.6);
   let fr = pow(1. - sat(abs(dot(n, V))), 2.);
   let bell = f32(i.ax <= 0.);
   let rim = ss(-.3, 0., i.ax) * bell;
   let E = sunE(i.wp.y, z) * (.4 + .6 * i.lt);
-  let lit = col * (E * .3 + amb(i.wp, n, 1., z) * .9);
+  let lit = pow(col, vec3f(1.5)) * (E * .3 + amb(i.wp, n, 1., z) * .9);
   let pul = .8 + .2 * sin(i.x.x * 50. + g.cam.w * 1.3) + i.x.w * .4;
-  let em = mix(gc, col, .4) * gi * pul * (bell * (.1 + fr * .45 + rim * .9) + (1. - bell) * (.3 - .15 * i.ax));
+  let em = (pow(col, vec3f(1.8)) * bell * (.08 + fr * .32) + gc * (bell * rim * .55 + (1. - bell) * (.22 - .1 * i.ax))) * gi * pul;
   let a = mix(.45 * (1. - .5 * i.ax), .16 + .5 * fr + rim * .3, bell);
   let T = exp(-sg(z).g * wlen(i.wp));
   let c = (lit * a + em + sel * vec3f(.5, .85, 1.) * fr) * T;
@@ -655,10 +674,6 @@ struct VO { @builtin(position) cp: vec4f, @location(0) wp: vec3f };
   o.wp = vec3f(p.x * g.box.x, 0., p.y * g.box.z);
   o.cp = g.vp * vec4f(o.wp, 1.);
   return o;
-}
-fn ripple(p: vec2f, d: f32) -> vec2f {
-  let fl = ss(260., 60., d);
-  return (textureSample(tW, sR, p / 13.).ba + textureSample(tW, sR, p.yx / 4.7 + .2).ba * .7 + textureSample(tW, sR, p / 37. + .6).ba * .8) * fl;
 }
 // seen from below: Snell's window onto the lamp-lit room, total internal reflection of the water around it
 @fragment fn fs(i: VO) -> @location(0) vec4f {
@@ -709,8 +724,11 @@ fn ripple(p: vec2f, d: f32) -> vec2f {
 }
 `;
 
-// glass walls: four transparent faces from the bottom to the rim, a light Fresnel reflection, bright edges and water line
+// glass walls: four faces from the bottom to the rim. In the scene pass: the faces seen from the water side (and, on Low,
+// the near ones too) with edges, a Fresnel reflection and, at grazing angles from the water, total internal reflection.
+// SPLIT (High, Medium): the faces with the camera on their outer side are left to the refraction pass (W_GLASSB).
 const W_GLASS = S_B + /*wgsl*/`
+override SPLIT: bool = false;
 struct VO { @builtin(position) cp: vec4f, @location(0) wp: vec3f, @location(1) uv: vec2f, @location(2) @interpolate(flat) n: vec3f, @location(3) @interpolate(flat) ext: vec2f };
 @vertex fn vs(@builtin(vertex_index) vi: u32) -> VO {
   var o: VO;
@@ -724,8 +742,19 @@ struct VO { @builtin(position) cp: vec4f, @location(0) wp: vec3f, @location(1) u
   o.cp = g.vp * vec4f(o.wp, 1.);
   return o;
 }
+// the camera's ray bent into the water where it enters the box (through a wall or the surface)
+fn inWater(V: vec3f, d: f32) -> vec3f {
+  let s = wseg(g.cam.xyz, V, d);
+  if (s.x <= 0.) { return V; }
+  let pe = g.cam.xyz + V * s.x;
+  var ne = vec3f(0., 1., 0.);
+  if (abs(abs(pe.x) - g.box.x) < .02) { ne = vec3f(sign(pe.x), 0., 0.); } else if (abs(abs(pe.z) - g.box.z) < .02) { ne = vec3f(0., 0., sign(pe.z)); }
+  return refract(V, ne, .7519);
+}
 @fragment fn fs(i: VO) -> @location(0) vec4f {
   let v = i.wp - g.cam.xyz; let d = length(v); let V = v / d;
+  let outer = dot(g.cam.xyz - i.wp, i.n) > 0.;
+  if (SPLIT && outer) { discard; }
   let ci = abs(dot(V, i.n));
   let fr = .04 + .96 * pow(1. - ci, 5.);
   let R = reflect(V, i.n * -sign(dot(i.n, V)));
@@ -736,12 +765,96 @@ struct VO { @builtin(position) cp: vec4f, @location(0) wp: vec3f, @location(1) u
   // the edges catch the room light: seen from outside only
   let s0 = wseg(g.cam.xyz, V, 1e-3); let ins = f32(s0.y > s0.x);
   let ek = (.4 + .6 * g.env.x) * (1. - ins);
-  var c = roomCol(i.wp, R) * fr * 3. + vec3f(.5, .8, .85) * (edge * .55 + wl * .25) * ek + vec3f(.012, .025, .025);
-  c += g.sunc.rgb * pow(sat(dot(R, g.sun.xyz)), 200.) * .6;
-  let a = sat(fr * .75 + .03 + (edge * .45 + wl * .15) * ek);
-  // the far walls are seen through the water
-  let s = wseg(g.cam.xyz, V, d - .02); let T = exp(-sg(0.).g * max(s.y - s.x, 0.));
-  return vec4f(min(c * T, vec3f(20.)), a * T);
+  var c = vec3f(.012, .025, .025) + vec3f(.35, .75, .58) * (edge * .55 + wl * .25) * ek;
+  var a = (edge * .45 + wl * .15) * ek + .03;
+  let z = zone(i.wp);
+  if (!outer && i.wp.y < 0.) {
+    // seen from the water: a faint reflection of the tank, a mirror past the critical angle (48.8 deg)
+    let Vw = inWater(V, d);
+    let cw = abs(dot(Vw, i.n));
+    let win = ss(0., .22, 1. - 1.769 * (1. - cw * cw));
+    let Rw = reflect(Vw, -i.n);
+    let rs = wseg(i.wp - i.n * .02, Rw, 300.);
+    let frw = .01 + .99 * (1. - win);
+    c += fogIn(i.wp, Rw, max(rs.y - rs.x, 1.), z, g.sun.xyz) * 1.1 * frw;
+    a = sat(a + frw);
+  } else {
+    c += roomCol(i.wp, R) * fr * 3. + g.sunc.rgb * pow(sat(dot(R, g.sun.xyz)), 200.) * .6;
+    a = sat(a + fr * .75);
+  }
+  // seen through water: dimmed by it, with the light it scatters in front of the glass
+  let s = wseg(g.cam.xyz, V, d - .02); let L = max(s.y - s.x, 0.);
+  var S = vec3f(0.); var T = vec3f(1.);
+  if (L > 0.) { let ro = g.cam.xyz + V * s.x; T = exp(-sg(z) * L); S = fogIn(ro, V, L, z, g.sun.xyz) * (.58 + .42 * vol(ro + V * L).g); }
+  return vec4f(min(c * T + S * a, vec3f(20.)), a);
+}
+`;
+
+// High, Medium: a second, single-sample pass over the resolved scene. The near walls refract what lies behind them
+// (a copy of the scene, looked up where the ray bent by the glass and the water ends; a little dispersion; the
+// view squeezes and shifts at grazing angles), tint it green with the glass, reflect the room (Fresnel) and show thin
+// greenish edges. The surface seen from above refracts the bottom through its ripples and reflects the room and lamp.
+const W_GLASSB = W_GLASS + /*wgsl*/`
+@group(1) @binding(0) var tCp: texture_2d<f32>;
+@group(1) @binding(1) var tZ: texture_depth_multisampled_2d;
+// distance along V to what the scene drew at pixel px (reverse-Z, infinite far plane)
+fn sdist(px: vec2f, V: vec3f) -> f32 { return g.fwd.w / max(textureLoad(tZ, vec2i(px), 0), 1e-7) / max(dot(V, g.fwd.xyz), 1e-3); }
+fn suv(p: vec3f) -> vec2f { let c = g.vp * vec4f(p, 1.); return vec2f(c.x, -c.y) / max(c.w, 1e-4) * .5 + .5; }
+@fragment fn fsNear(i: VO) -> @location(0) vec4f {
+  if (dot(g.cam.xyz - i.wp, i.n) <= 0.) { discard; }
+  let v = i.wp - g.cam.xyz; let d = length(v); let V = v / d;
+  let ci = sat(dot(-V, i.n));
+  let fr = .04 + .96 * pow(1. - ci, 5.);
+  let R = reflect(V, i.n);
+  let px = max(.02, d * .0009);
+  let e = min(min(i.uv.x, i.ext.x - i.uv.x), min(i.uv.y, i.ext.y - i.uv.y));
+  let edge = ss(px * 1.8, px * .3, e);
+  let wl = ss(px * 1.6, 0., abs(i.wp.y));
+  let wet = ss(0., -px * 1.5, i.wp.y);
+  let ek = .4 + .6 * g.env.x;
+  let refl = roomCol(i.wp, R) * 2.4 + g.sunc.rgb * pow(sat(dot(R, g.sun.xyz)), 300.) * .8;
+  let edc = vec3f(.30, .70, .52) * (edge * .6 + wl * .3) * ek;
+  // above the water line: a thin pane in air, nothing to bend; blend over the scene
+  if (wet <= 0.) { return vec4f(min(refl * fr + edc + vec3f(.004, .009, .008), vec3f(20.)), sat(fr * .75 + .02 + edge * .5 + wl * .2)); }
+  // below: the bent ray, followed for half its way through the water (smooth across the face, so thin leaves in front
+  // of a far background do not tear); no bending at the corners
+  let ws = wseg(i.wp - i.n * .01, V, 1e4);
+  let L = clamp(ws.y * .5, 0., 40.);
+  let fade = ss(0., 1.2, min(i.uv.x, i.ext.x - i.uv.x)) * wet;
+  let p0 = suv(i.wp + V * L); let uv0 = i.cp.xy * g.res.zw;
+  let ur = uv0 + (suv(i.wp + refract(V, i.n, 1. / 1.329) * L) - p0) * fade;
+  let ug = uv0 + (suv(i.wp + refract(V, i.n, 1. / 1.333) * L) - p0) * fade;
+  let ub = uv0 + (suv(i.wp + refract(V, i.n, 1. / 1.339) * L) - p0) * fade;
+  let behind = vec3f(textureSampleLevel(tCp, sC, ur, 0.).r, textureSampleLevel(tCp, sC, ug, 0.).g, textureSampleLevel(tCp, sC, ub, 0.).b);
+  // the glass: faintly green, more so through its thickness at a slant
+  let tint = exp(-vec3f(.10, .025, .06) * (.35 + .65 / max(ci, .2)));
+  let c = behind * tint * (1. - fr) + refl * fr + edc;
+  return vec4f(min(c, vec3f(40.)), 1.);
+}
+struct VT { @builtin(position) cp: vec4f, @location(0) wp: vec3f };
+@vertex fn vsTop(@builtin(vertex_index) i: u32) -> VT {
+  var o: VT;
+  let p = vec2f(f32(i & 1u), f32(i >> 1u)) * 2. - 1.;
+  o.wp = vec3f(p.x * g.box.x, 0., p.y * g.box.z);
+  o.cp = g.vp * vec4f(o.wp, 1.);
+  return o;
+}
+@fragment fn fsTopB(i: VT) -> @location(0) vec4f {
+  let v = i.wp - g.cam.xyz; let d = length(v); let V = v / d;
+  let ds = sdist(i.cp.xy, V);
+  if (ds < d - .05) { discard; }
+  let s = ripple(i.wp.xz, d);
+  let n = normalize(vec3f(-s.x * .35, 1., -s.y * .35));
+  let fr = .02 + .98 * pow(1. - sat(dot(-V, n)), 5.);
+  let R = reflect(V, n);
+  // the flat surface lifts the bottom (half the way through the water, as for the walls); the ripples bend it over a few metres
+  let ws = wseg(i.wp - vec3f(0., .01, 0.), V, 1e4);
+  let L = clamp(ws.y * .5, 0., 30.); let Lr = min(L, 4.);
+  let Vf = refract(V, vec3f(0., 1., 0.), .7519);
+  let uv = i.cp.xy * g.res.zw + suv(i.wp + Vf * L) - suv(i.wp + V * L) + suv(i.wp + refract(V, n, .7519) * Lr) - suv(i.wp + Vf * Lr);
+  let below = textureSampleLevel(tCp, sC, uv, 0.).rgb;
+  let c = below * (1. - fr) + roomCol(i.wp, R) * fr + g.sunc.rgb * pow(sat(dot(R, g.sun.xyz)), 400.) * 4. + vec3f(.006, .02, .028) * g.env.x * .5;
+  return vec4f(min(c, vec3f(40.)), 1.);
 }
 `;
 

@@ -82,6 +82,7 @@ def check(nowa: str | None, baseline_file: Path | None, write_baseline: bool) ->
         intro = brain.introspect()
         assert intro["episodes"] > 0, "no episodes recorded"
         assert intro["affect"], "affect axes unavailable"
+        assert any(abs(v) > 1e-6 for v in intro["affect"].values()),             "affect is frozen at zero: the host contract (step dt / commit order) is broken"
         ctx["brain"], ctx["rng"] = brain, rng
         tail = sorted(costs[-100:])
         report["perf"] = {"decision_ms_p50": round(tail[50], 3), "decision_ms_p95": round(tail[94], 3),

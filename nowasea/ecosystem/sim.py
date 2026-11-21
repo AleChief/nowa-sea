@@ -16,6 +16,7 @@ import numpy as np
 
 from nowasea.brains import nowa_adapter as na
 from nowasea.brains.nowa_adapter import BrainSpec
+from nowasea.ecosystem.insights import Insights
 from nowasea.ecosystem.resources import Particles, Plankton
 from nowasea.ecosystem.species import BY_ID, DAY_S, PREY_OF, SPECIES, Species
 from nowasea.server.protocol import (CREATURE_DTYPE, FLAG_BURST, FLAG_COVER, FLAG_EAT, FLAG_SELECTED, FLAG_SLEEP,
@@ -23,6 +24,11 @@ from nowasea.server.protocol import (CREATURE_DTYPE, FLAG_BURST, FLAG_COVER, FLA
 from nowasea.world.tank import Tank, build_tank
 
 INTENTS: List[str] = sorted({a for s in SPECIES for a in s.actions} | {"sleep"})
+
+
+def _rownorm(x: np.ndarray) -> np.ndarray:
+    """Euclidean norm of each row; einsum is several times faster than linalg.norm on small arrays."""
+    return np.sqrt(np.einsum("ij,ij->i", x, x))
 I = {name: i for i, name in enumerate(INTENTS)}
 NSP = len(SPECIES)
 CAPACITY = 192
@@ -36,11 +42,12 @@ class SimConfig:
     brain_kind: str = "nowa"            # "nowa" or "stub"
     dt: float = 0.05
     perceive_every: int = 5             # steps between perception passes (0.25 s)
-    decide_min: float = 0.5
-    decide_max: float = 3.0
+    decide_min: float = 2.0             # an intent is held at least this long unless something urgent happens
+    decide_max: float = 8.0             # re-ask after this long only if something is worth learning from
     urgent_min: float = 0.25
     hippocampus_capacity: int = 128      # 256 doubles p95 decision cost (docs/nowa-host-guide.md, section 5)
     max_total: int = 80                 # NOWA agents
+    control_share: float = 0.25         # share of NOWA creatures in the frozen control caste (0 = none)
     repop_enabled: bool = True
     repop_delay_s: float = 300.0
     repop_mode: str = "archive"         # "archive" or "fresh"
@@ -85,14 +92,24 @@ class Simulation:
         self.history: List[list] = []
         self._last_history = -1e9
         self.births = 0
+        self.sleep_errors = 0
         self.deaths: Dict[str, int] = {}
+        self.deaths_sp: Dict[str, Dict[str, int]] = {sp.id: {} for sp in SPECIES}   # species -> cause -> n
+        self.gen_stats: Dict[str, Dict[str, dict]] = {sp.id: {} for sp in SPECIES}   # species -> generation -> sums
+        # Family register: every creature ever born (bounded), for the lineage view.
+        self.lineage: Dict[int, dict] = {}
+        self.births_sp: Dict[str, int] = {sp.id: 0 for sp in SPECIES}
         self.extinct_since: Dict[str, float] = {}
         self.archive: Dict[str, List[dict]] = {s.id: [] for s in SPECIES}
         self.selected = 0
         self.specs = {s.id: BrainSpec(species=s.id, actions=s.actions,
                                       wake_interval_s=max(60.0, (1.0 - self._window_len(s)) * DAY_S),
                                       hippocampus_capacity=cfg.hippocampus_capacity) for s in SPECIES if s.brain == "nowa"}
+        from dataclasses import replace as _replace
+
+        self.specs_frozen = {k: _replace(v, frozen=True) for k, v in self.specs.items()}
         self._alloc()
+        self.insights = Insights(CAPACITY, INTENTS, self.tank)
         self.meta: Dict[int, dict] = {}          # slot -> python-side data
         self.slot_of: Dict[int, int] = {}        # creature id -> slot
         self._shelters = np.array([s["c"] for s in self.tank.shelters]) if self.tank.shelters else np.zeros((0, 3))
@@ -109,7 +126,10 @@ class Simulation:
         self._kind_names = {PARTICLE_FOOD: "pellet", PARTICLE_DETRITUS: "detritus", PARTICLE_CARCASS: "carcass"}
         self._edible = np.array([[name in s.diet for k, name in sorted(self._kind_names.items())] for s in SPECIES])
         self._eats_particles = self._edible.any(axis=1)
-        self._eat_intents = [I[n] for n in ("forage", "scavenge", "school", "explore", "drift")]
+        self._no_eat_intents = [I[n] for n in ("flee", "strike", "chase", "sleep")]
+        self._no_eat_mask = np.zeros(len(INTENTS), dtype=bool)
+        self._no_eat_mask[self._no_eat_intents] = True
+        self._grazer_sp = np.array(["plankton" in s.diet for s in SPECIES])
         if populate:
             t = self.tank
             pts = self.rng.uniform([-t.half_x + 2, -t.depth, -t.half_z + 2], [t.half_x - 2, -t.depth, t.half_z - 2], (60, 3))
@@ -170,6 +190,20 @@ class Simulation:
         self.metab_g = np.ones(C)
         self.brain_ready = np.zeros(C, dtype=bool)
         self.strike_cd = np.zeros(C)              # seconds until the next lunge
+        # Learning statistics per creature (aggregated per species and generation at death).
+        self.attempts = np.zeros(C, dtype=np.int32)    # lunges at prey
+        self.catches = np.zeros(C, dtype=np.int32)
+        self.encounters = np.zeros(C, dtype=np.int32)  # a predator came close
+        self.escapes = np.zeros(C, dtype=np.int32)     # ... and it lived through it
+        self.in_encounter = np.zeros(C, dtype=bool)
+        self.reward_sum = np.zeros(C)
+        self.reward_n = np.zeros(C, dtype=np.int32)
+        # For action-contingent rewards: distance to the nearest visible threat / prey at the previous look.
+        self.last_threat_d = np.full(C, np.inf)
+        self.last_food_d = np.full(C, np.inf)
+        self.last_prey_d = np.full(C, np.inf)
+        # Policy quality: how often the chosen action fits the situation it was chosen in.
+        self.q_counts = np.zeros((C, 6), dtype=np.int32)   # threat n/ok, hunger n/ok, prey n/ok
         self.digest = np.zeros(C)                 # seconds of digestion left after a meal
         self.decisions = np.zeros(C, dtype=np.int32)
 
@@ -186,6 +220,12 @@ class Simulation:
 
     def max_nowa(self) -> int:
         return max(4, int(round(self.cfg.max_total * max(self.cfg.scale, 0.05))))
+
+    def has_room(self, s: Species) -> bool:
+        """Free slot, and for NOWA species a free brain under the configured ceiling."""
+        if int(self.alive.sum()) >= CAPACITY - 1:
+            return False
+        return s.brain != "nowa" or self.nowa_count() < self.max_nowa()
 
     def count(self, species_id: str) -> int:
         return int((self.alive & (self.sp == BY_ID[species_id].index)).sum())
@@ -207,7 +247,7 @@ class Simulation:
 
     def spawn(self, species_id: str, pos=None, genome: Optional[dict] = None, epigenome: Optional[dict] = None,
               body: Optional[dict] = None, parents=(0, 0), generation: int = 0, age_frac: float = 0.0,
-              energy: float = 0.7) -> int:
+              energy: float = 0.7, caste: Optional[str] = None) -> int:
         s = BY_ID[species_id]
         slot = self._free_slot()
         cid = self.next_id
@@ -247,35 +287,56 @@ class Simulation:
         self.cooldown[slot] = 0.2 * DAY_S
         self.strike_cd[slot] = 0.0
         self.digest[slot] = 0.0
+        for arr in (self.attempts, self.catches, self.encounters, self.escapes, self.reward_n):
+            arr[slot] = 0
+        self.in_encounter[slot] = False
+        self.reward_sum[slot] = 0.0
+        self.q_counts[slot] = 0
+        self.last_threat_d[slot] = np.inf
+        self.last_food_d[slot] = np.inf
+        self.last_prey_d[slot] = np.inf
         self.gen[slot] = generation
         self.children[slot] = 0
         self.decisions[slot] = 0
         self.waypoint[slot] = self.random_open_point(s)
         self.glow[slot] = 0.3
+        if s.brain != "nowa" or self.cfg.brain_kind != "nowa":
+            caste = "plastic"
+        elif caste not in ("plastic", "frozen"):
+            caste = "frozen" if self.prng.random() < self.cfg.control_share else "plastic"
         self.meta[slot] = {"tokens": [], "prev_tokens": None, "executed": None, "parents": list(parents),
-                           "born": self.time, "genome": genome, "slept_window": None, "mode": "",
-                           "sleep_requested": False}
+                           "born": self.time, "genome": genome, "epigenome": epigenome, "slept_window": None,
+                           "mode": "", "sleep_requested": False, "caste": caste}
         self.slot_of[cid] = slot
+        self.insights.on_spawn(slot, caste)
+        self._register_birth(cid, s.id, generation, parents)
+        if any(parents):
+            self.insights.on_birth(self, s.id, generation, cid)
+        if any(parents):
+            self.births_sp[s.id] += 1
         if s.brain == "nowa":
             seed = int(self.prng.randrange(1 << 30))
-            self.pool.create(cid, self.specs[s.id], genome=genome, epigenome=epigenome, seed=seed)
+            spec = (self.specs_frozen if caste == "frozen" else self.specs)[s.id]
+            self.pool.create(cid, spec, genome=genome, epigenome=epigenome, seed=seed)
             self.brain_ready[slot] = True
         return cid
 
     def kill(self, slot: int, cause: str) -> None:
         if not self.alive[slot]:
             return
+        self.insights.on_death(self, slot, cause)
         s = SPECIES[self.sp[slot]]
         self.alive[slot] = False
         cid = int(self.cid[slot])
         self.slot_of.pop(cid, None)
         meta = self.meta.pop(slot, {})
         if s.brain == "nowa":
-            genome = self.pool.created_genomes.pop(cid, None) or meta.get("genome")
+            genome = meta.get("genome")
             fitness = self.age[slot] / DAY_S + 2.0 * self.children[slot]
             if genome:
                 arch = self.archive[s.id]
                 arch.append({"fitness": round(float(fitness), 3), "genome": genome, "generation": int(self.gen[slot]),
+                             "epigenome": meta.get("epigenome"),
                              "body": {"speed": float(self.speed_g[slot]), "vision": float(self.vision_g[slot]),
                                       "metabolism": float(self.metab_g[slot])}})
                 arch.sort(key=lambda e: -e["fitness"])
@@ -284,7 +345,13 @@ class Simulation:
         self.brain_ready[slot] = False
         if cause != "eaten":
             self.particles.add(self.pos[slot], PARTICLE_CARCASS, s.body_content * max(0.3, self.energy[slot] + 0.3))
+        self._record_generation(slot, cause)
+        rec = self.lineage.get(cid)
+        if rec is not None:
+            rec["died"] = round(self.time, 1)
+            rec["cause"] = cause
         self.deaths[cause] = self.deaths.get(cause, 0) + 1
+        self.deaths_sp[s.id][cause] = self.deaths_sp[s.id].get(cause, 0) + 1
         self.events.append({"t": "event", "kind": "death", "cause": cause, "species": s.id, "id": cid,
                             "pos": self.pos[slot].round(2).tolist()})
         if self.selected == cid:
@@ -300,8 +367,8 @@ class Simulation:
         phase = day_phase(self.time)
         light = light_level(phase)
         self._apply_answers()
-        self._sleep_schedule(phase)
         if self.steps % self.cfg.perceive_every == 0:
+            self._sleep_schedule(phase)
             self._perceive(light)
             self._schedule_decisions()
         self._motor(dt)
@@ -316,9 +383,11 @@ class Simulation:
             self._marine_snow(slow_dt)
             self.particles.step(slow_dt, self.plankton)
             self._repopulate()
+            self.insights.tick(self, np.nonzero(self.alive)[0], phase, slow_dt)
         if self.time - self._last_history >= self.cfg.history_every_s:
             self._last_history = self.time
-            self.history.append([round(self.time, 1), [self.count(s.id) for s in SPECIES]])
+            self.history.append([round(self.time, 1), [self.count(s.id) for s in SPECIES],
+                                 round(float(self.plankton.rho.mean()), 3), round(float(self.plankton.nutrient), 3)])
             if len(self.history) > self.cfg.history_len:
                 # keep long history coarse: drop every other point in the older half
                 half = len(self.history) // 2
@@ -326,20 +395,41 @@ class Simulation:
 
     # ----- brains -------------------------------------------------------------------------------------
     def _apply_answers(self):
-        for cid, action, mode, no_action, _ms in self.pool.take_answers():
+        for ans in self.pool.take_answers():
+            cid, action, mode, no_action, _ms = ans[:5]
+            mood = ans[5] if len(ans) > 5 else None
             slot = self.slot_of.get(cid)
-            if slot is None or not action:
+            if slot is None:
                 continue
+            if not action:
+                # The brain was asleep or busy: give the reward and the interval back for the next request.
+                sub = self.meta[slot].pop("submitted", None)
+                if sub is not None:
+                    self.reward[slot] += sub[0]
+                    self.last_decide[slot] = sub[1]
+                    self.meta[slot]["prev_tokens"] = sub[2]
+                continue
+            self.meta[slot].pop("submitted", None)
             if self.sleeping[slot]:
+                # Asleep by the time the answer came: the body rested; tell the core so on the next commit.
+                acts = SPECIES[self.sp[slot]].actions
+                self.meta[slot]["executed"] = "rest" if "rest" in acts else acts[0]
                 continue
             self.intent[slot] = I.get(action, self.intent[slot])
             self.decisions[slot] += 1
             m = self.meta[slot]
             m["mode"] = mode
             m["executed"] = action
+            self._score_choice(slot, m.get("prev_tokens") or [], action)
+            self.insights.on_decision(self, slot, m.get("prev_tokens") or [], action, bool(no_action), mood, mode)
             self._on_new_intent(slot)
         for cid, _ms, err in self.pool.take_slept():
-            pass
+            if not err and cid in self.slot_of:
+                self.insights.on_slept(self.slot_of[cid])
+            if err:
+                self.sleep_errors += 1
+                self.events.append({"t": "toast", "level": "error",
+                                    "text": {"ru": f"Сбой сна мозга #{cid}: {err}", "en": f"Brain #{cid} sleep failed: {err}"}})
         if self.pool.errors:
             err = self.pool.errors.pop(0)
             raise RuntimeError(f"brain worker error: {err}")
@@ -380,16 +470,71 @@ class Simulation:
             if not ((urgent and since >= cfg.urgent_min) or (changed and since >= cfg.decide_min)
                     or since >= cfg.decide_max):
                 continue
+            # Same context, nothing happened: do not ask again. An empty continuation would only fill the
+            # hippocampus with zero-reward episodes that push unconsolidated learning out before sleep.
+            if not changed and not urgent and abs(float(self.reward[slot])) < 0.05 and m["executed"]:
+                continue
             elapsed = since if self.last_decide[slot] > -1e8 else 0.0
-            novelty = 0.0 if prev is None else len(set(toks) ^ set(prev)) / max(1, len(toks))
-            conflict = 0.5 if (self.threat_level[slot] and ("food:near" in toks or self.prey_level[slot])) else 0.0
+            novelty = 0.0 if prev is None else min(1.0, len(set(toks) ^ set(prev)) / max(1, 2 * len(toks)))
+            senses = m.get("senses") or toks
+            conflict = 0.5 if (self.threat_level[slot] and ("food:near" in senses or self.prey_level[slot])) else 0.0
             reward = float(np.clip(self.reward[slot], -1.0, 1.0)) if m["executed"] else None
-            reqs.append((cid, list(toks), m["executed"], reward, float(elapsed), float(novelty), conflict, None))
+            if reward is not None:
+                self.reward_sum[slot] += reward
+                self.reward_n[slot] += 1
+            reqs.append((cid, list(toks), m["executed"], reward, float(elapsed), float(novelty), conflict,
+                         self._drives(int(slot)) or None))
             m["prev_tokens"] = list(toks)
+            m["submitted"] = (0.0 if reward is None else float(self.reward[slot]), float(self.last_decide[slot]),
+                              prev)                    # tokens before this request, restored if it is skipped
             self.reward[slot] = 0.0
             self.last_decide[slot] = self.time
         if reqs:
             self.pool.submit(reqs)
+
+    FEED_ACTIONS = {"sparkfin": ("forage",), "sweeper": ("scavenge",), "needlejaw": ("ambush", "stalk"),
+                    "shade": ("patrol", "chase")}
+
+    def _drives(self, slot: int) -> Dict[str, float]:
+        """Body pressure on the choice (NOWA ``physiological_bias``): soft, the brain may still override it.
+
+        Without it an untrained brain picks feeding about as often as anything else and starves before it
+        has learnt; with it the body pushes the way hunger, fear and fatigue push an animal.
+        """
+        s = SPECIES[self.sp[slot]]
+        acts = s.actions
+        bias: Dict[str, float] = {}
+
+        def add(action, value):
+            if action in acts and value > 0:
+                bias[action] = bias.get(action, 0.0) + float(value)
+
+        e, st = float(self.energy[slot]), float(self.stamina[slot])
+        # Innate strength: like fear and hunger in animals these are loud; learning refines the choice between
+        # the instinctive options (flee or hide or school, stalk or strike) and when to override them.
+        hunger = max(0.0, 0.6 - e) * 3.2                      # 0 .. 1.9
+        if self.threat_level[slot] == 2:
+            hunger *= 0.3                                      # a predator at arm's length silences hunger
+        for a in self.FEED_ACTIONS.get(s.id, ()):
+            add(a, hunger)
+        if self.prey_level[slot] == 2:
+            add("strike", 0.5 + hunger)
+        elif self.prey_level[slot] == 1:
+            add("chase", 0.3 + hunger * 0.5)
+            add("stalk", 0.3 + hunger * 0.5)
+        if self.threat_level[slot] == 2:
+            add("flee", 1.0)
+            add("hide", 0.8)
+            add("burrow", 0.8)
+        elif self.threat_level[slot] == 1:
+            add("hide", 0.4)
+            add("school", 0.4)
+            add("burrow", 0.3)
+        if st < 0.3:
+            add("rest", (0.3 - st) * 2.0)
+        if self.mate[slot] >= 0 and e > 0.7:
+            add("mate", 0.4)
+        return bias
 
     def oldest_pending_s(self, wall_now: float) -> float:
         if not self.pool.pending:
@@ -484,18 +629,27 @@ class Simulation:
         ready = (self.age[idx] >= self.mature_age[idx]) & ~self.sleeping[idx] & (self.cooldown[idx] <= 0) & \
             (self.energy[idx] >= self._sp_arr["breed_energy"][sp] - 0.1)
         ready_self = ready & (self.energy[idx] >= self._sp_arr["breed_energy"][sp])
-        mate_m = same & (D < 6.0) & ready[None, :] & ready_self[:, None]
+        # Sparse big species find partners from farther away (scent, sound): 3/4 of their vision, at least 6 m.
+        mate_r = np.maximum(6.0, 0.75 * self._sp_arr["vision"][sp])
+        mate_m = same & (D < mate_r[:, None]) & ready[None, :] & ready_self[:, None]
         mate_any = mate_m.any(axis=1)
         mate_j = np.where(mate_any, np.argmax(mate_m, axis=1), -1)
         mature = self.age[idx] >= self.mature_age[idx]
 
         cover_now = (shelter_d < 0.0) | ((self.intent[idx] == I["burrow"]) & (speed < 0.3))
+        self._contingent_rewards(idx, has_t, t_dist, has_p, p_dist, cover_now)
         self.in_cover[idx] = cover_now
         prev_t = self.threat_level[idx].copy()
         prev_p = self.prey_level[idx].copy()
         # Threat state.
         tl = np.where(has_t, np.where(t_near, 2, 1), np.where(now - self.threat_seen[idx] > 2.0, 0, prev_t))
         self.threat_level[idx] = tl
+        onset = (tl == 2) & ~self.in_encounter[idx]
+        self.encounters[idx[onset]] += 1
+        self.in_encounter[idx[onset]] = True
+        over = (tl == 0) & self.in_encounter[idx]
+        self.escapes[idx[over]] += 1
+        self.in_encounter[idx[over]] = False
         if has_t.any():
             self.threat_vec[idx[has_t]] = -U[ar[has_t], tj[has_t]]
             self.threat_seen[idx[has_t]] = now
@@ -541,8 +695,7 @@ class Simulation:
                     level = max(level, 2 if dens[a] > 0.45 else (1 if dens[a] > 0.15 or grad[a].any() else 0))
                 toks.append("food:" + NFL[level])
             if "cover" in feats:
-                toks.append("cover:" + ("in" if cover_now[a] else ("near" if (shelter_d[a] < 6.0 or rock_d[a] < 1.2)
-                                                                    else "far")))
+                toks.append("cover:" + ("in" if cover_now[a] else ("near" if shelter_d[a] < 6.0 else "far")))
             if "school" in feats:
                 toks.append("school:" + ("alone" if sn[a] == 0 else ("few" if sn[a] < 4 else "many")))
             e, st = energy[a], stamina[a]
@@ -553,9 +706,66 @@ class Simulation:
             if "mate" in feats and mature[a]:
                 toks.append("mate:" + ("near" if mate_j[a] >= 0 else "none"))
             m = self.meta[slot]
-            m["tokens"] = toks
-            if (tl[a] == 2 and prev_t[a] < 2) or (pl[a] > 0 and prev_p[a] == 0):
-                m["urgent"] = True
+            m["senses"] = toks                     # everything the body perceives (inspector)
+            m["tokens"] = self._salient(s, toks)   # what the brain is given: the few that matter now
+            if (tl[a] == 2 and prev_t[a] < 2) or (pl[a] > 0 and prev_p[a] == 0) \
+                    or (tl[a] == 0 and prev_t[a] > 0) or (pl[a] == 0 and prev_p[a] > 0):
+                m["urgent"] = True                 # danger came or went, prey appeared or was lost
+
+    def _contingent_rewards(self, idx, has_t, t_dist, has_p, p_dist, cover_now) -> None:
+        """Rewards that depend on what the creature did, not only on where it was.
+
+        A penalty for merely being near a predator punishes every action alike, so nothing is learnt from it.
+        Gaining distance from a visible threat, reaching cover under threat and (for a hungry predator)
+        closing in on prey are credited to the action that produced them. See docs/nowa-host-guide.md.
+        """
+        # Running away is credited by the creature's own speed away from the threat, not by the change of
+        # distance: a sparkfin fleeing a faster shade still loses distance while doing the right thing.
+        if has_t.any():
+            v = self.vel[idx[has_t]]
+            away = (v * self.threat_vec[idx[has_t]]).sum(axis=1)
+            top = self._sp_arr["burst"][self.sp[idx[has_t]].astype(int)]
+            self.reward[idx[has_t]] += 0.12 * np.clip(away / np.maximum(top, 1e-6), -1.0, 1.0)
+        # Hungry and food in sight: credit getting closer to it.
+        fp = self.food_pos[idx]
+        hungry = (self.energy[idx] < 0.6) & ~np.isnan(fp[:, 0])
+        prev_f = self.last_food_d[idx]
+        fd = np.where(hungry, np.linalg.norm(np.nan_to_num(fp) - self.pos[idx], axis=1), np.inf)
+        both = hungry & np.isfinite(prev_f)
+        if both.any():
+            self.reward[idx[both]] += np.clip((prev_f[both] - fd[both]) / 4.0, -0.08, 0.12)
+        self.last_food_d[idx] = fd
+        reached = cover_now & ~self.in_cover[idx] & (self.threat_level[idx] > 0)
+        self.reward[idx[reached]] += 0.4
+        self.last_threat_d[idx] = np.where(has_t, t_dist, np.inf)
+        prev_p = self.last_prey_d[idx]
+        both = has_p & np.isfinite(prev_p)
+        if both.any():
+            close = np.clip((prev_p[both] - p_dist[both]) / 6.0, -0.15, 0.2)
+            self.reward[idx[both]] += close
+        self.last_prey_d[idx] = np.where(has_p, p_dist, np.inf)
+
+    @staticmethod
+    def _salient(s: Species, toks) -> list:
+        """The 2-3 context tokens that matter in the current situation.
+
+        NOWA keys its memories by the context it is given. Nine 3-level features make almost every moment a new
+        context and nothing transfers: on the bench, learning fell from 0.65 -> 1.0 (4 features) to none at all
+        (9 features). An animal attends to what is salient; so does this host (docs/nowa-host-guide.md).
+        """
+        f = dict(t.split(":", 1) for t in toks)
+        if f.get("threat") in ("near", "far"):
+            keys = ("threat", "cover", "stamina")
+        elif f.get("prey") in ("near", "far"):
+            keys = ("prey", "stamina", "energy")
+        elif f.get("energy") == "low":
+            keys = ("energy", "food", "prey")
+        elif f.get("mate") == "near" and f.get("energy") == "high":
+            keys = ("mate", "energy")
+        else:
+            keys = ("food", "school", "light", "energy", "edge")
+        out = [f"{k}:{f[k]}" for k in keys if k in f]
+        return out[:3]
 
     def _ready_to_breed(self, slot: int, slack: float = 0.0) -> bool:
         s = SPECIES[self.sp[slot]]
@@ -576,7 +786,7 @@ class Simulation:
                 window_id = day_no if s.sleep_window[0] < s.sleep_window[1] or phase >= s.sleep_window[0] else day_no - 1
                 if s.brain == "nowa" and m.get("slept_window") != window_id:
                     m["slept_window"] = window_id
-                    self.pool.sleep(int(self.cid[slot]), 3)
+                    self.pool.sleep(int(self.cid[slot]), 3, self._window_len(s) * DAY_S)
             elif not should and self.sleeping[slot]:
                 self.sleeping[slot] = False
                 self.intent[slot] = I[s.actions[0]]
@@ -601,7 +811,7 @@ class Simulation:
         def seek(mask, target, gain=1.0):
             if mask.any():
                 d = target[mask] - P[mask]
-                desired[mask] += d / np.maximum(np.linalg.norm(d, axis=1), 1e-6)[:, None] * gain
+                desired[mask] += d / np.maximum(_rownorm(d), 1e-6)[:, None] * gain
 
         onehot = intent[:, None] == np.arange(len(INTENTS))[None, :]
 
@@ -611,7 +821,7 @@ class Simulation:
         # Wander-type intents.
         m = by("explore", "patrol")
         if m.any():
-            reached = np.linalg.norm(self.waypoint[idx] - P, axis=1) < 3.0
+            reached = _rownorm(self.waypoint[idx] - P) < 3.0
             for k in np.nonzero(m & reached)[0]:
                 self.waypoint[idx[k]] = self.random_open_point(SPECIES[sp[k]])
             seek(m, self.waypoint[idx])
@@ -653,7 +863,7 @@ class Simulation:
         m = by("hide", "burrow", "rest", "ambush", "sleep")
         if m.any():
             home = self.home[idx]
-            dh = np.linalg.norm(home - P, axis=1)
+            dh = _rownorm(home - P)
             far = m & (dh > 1.0)
             seek(far, home)
             near = m & ~far
@@ -662,6 +872,7 @@ class Simulation:
             speed[m & by("rest", "sleep")] *= 0.6
             bur = by("burrow") & near
             speed[bur] = 0.0
+            want_burst |= by("hide", "burrow") & far & (self.threat_level[idx] == 2)
         # Hunting.
         m = by("stalk", "chase", "strike")
         if m.any():
@@ -670,11 +881,11 @@ class Simulation:
             live = tgt >= 0
             tpos[live] = self.pos[tgt[live]] + self.vel[tgt[live]] * 0.4
             seek(m, tpos)
-            lost_reached = m & ~live & (np.linalg.norm(tpos - P, axis=1) < 2.0)
+            lost_reached = m & ~live & (_rownorm(tpos - P) < 2.0)
             for k in np.nonzero(lost_reached)[0]:   # searched the last-seen spot: give up, wander
                 self.intent[idx[k]] = I["patrol"] if "patrol" in SPECIES[sp[k]].actions else I["explore"]
                 self.waypoint[idx[k]] = self.random_open_point(SPECIES[sp[k]])
-            dist = np.linalg.norm(tpos - P, axis=1)
+            dist = _rownorm(tpos - P)
             stalk = by("stalk")
             speed[stalk] *= 0.6
             want_burst |= (by("strike") | (by("chase") & (dist < 8.0))) & live
@@ -708,13 +919,13 @@ class Simulation:
                 push = (diff / D[:, :, None]) * ((rr - D) / rr)[:, :, None] * close[:, :, None]
                 desired += push.sum(axis=1) * 3.0
         # Obstacles: look ahead along velocity.
-        look = np.maximum(1.5, np.linalg.norm(V, axis=1) * 1.2) + radius
-        ahead = P + V / np.maximum(np.linalg.norm(V, axis=1), 1e-6)[:, None] * look[:, None]
+        look = np.maximum(1.5, _rownorm(V) * 1.2) + radius
+        ahead = P + V / np.maximum(_rownorm(V), 1e-6)[:, None] * look[:, None]
         da = t.sd_fast(ahead) - radius
         near = da < 1.5
         if near.any():
             g = t.gradient(ahead[near])
-            vdir = V[near] / np.maximum(np.linalg.norm(V[near], axis=1), 1e-6)[:, None]
+            vdir = V[near] / np.maximum(_rownorm(V[near]), 1e-6)[:, None]
             toward = np.maximum(0.0, -(vdir * g).sum(axis=1))      # only when heading into the rock
             desired[near] += g * ((1.5 - da[near]) * (0.3 + toward))[:, None] * 1.5
         # Glass, floor and surface.
@@ -730,10 +941,10 @@ class Simulation:
         bursting = want_burst & can_burst
         speed = np.where(bursting, burst, speed)
         self.burst[idx] = bursting
-        dn = np.linalg.norm(desired, axis=1)
-        wdir = np.where(dn[:, None] > 1e-6, desired / np.maximum(dn, 1e-6)[:, None], V / np.maximum(np.linalg.norm(V, axis=1), 1e-6)[:, None])
+        dn = _rownorm(desired)
+        wdir = np.where(dn[:, None] > 1e-6, desired / np.maximum(dn, 1e-6)[:, None], V / np.maximum(_rownorm(V), 1e-6)[:, None])
         # Turn-rate limited rotation of the heading towards the desired direction.
-        vs = np.linalg.norm(V, axis=1)
+        vs = _rownorm(V)
         u = np.where(vs[:, None] > 0.05, V / np.maximum(vs, 1e-6)[:, None], wdir)
         cosang = np.clip((u * wdir).sum(axis=1), -1.0, 1.0)
         ang = np.arccos(cosang)
@@ -745,7 +956,7 @@ class Simulation:
         w1 = np.where(small, 1.0 - frac, np.sin((1 - frac) * ang) / np.maximum(sin_a, 1e-9))
         w2 = np.where(small, frac, np.sin(frac * ang) / np.maximum(sin_a, 1e-9))
         newdir = u * w1[:, None] + wdir * w2[:, None]
-        newdir /= np.maximum(np.linalg.norm(newdir, axis=1), 1e-9)[:, None]
+        newdir /= np.maximum(_rownorm(newdir), 1e-9)[:, None]
         accel = self._sp_arr["accel"][sp] * dt
         newspeed = vs + np.clip(speed - vs, -accel * 1.5, accel)
         V = newdir * newspeed[:, None]
@@ -781,10 +992,10 @@ class Simulation:
         self.cooldown[idx] -= dt
         # Rewards between decisions (energy change is added where food is eaten).
         threat = self.threat_level[idx]
-        self.reward[idx] += np.where(threat == 2, -0.04, np.where(threat == 1, -0.01, 0.0)) * dt / 0.25
+        self.reward[idx] += np.where(threat == 2, -0.01, np.where(threat == 1, -0.0025, 0.0)) * dt / 0.25  # mild: the contingent rewards carry the lesson
         self.reward[idx] += np.where((threat > 0) & self.in_cover[idx], 0.03, 0.0) * dt / 0.25
-        self.reward[idx] -= np.where(self.stamina[idx] < 0.1, 0.01, 0.0)
-        self.reward[idx] -= np.where(self.energy[idx] < 0.15, 0.005, 0.0)
+        self.reward[idx] -= np.where(self.stamina[idx] < 0.1, 0.04, 0.0) * dt
+        self.reward[idx] -= np.where(self.energy[idx] < 0.15, 0.02, 0.0) * dt
 
     def _feed(self, dt: float):
         idx = np.nonzero(self.alive)[0]
@@ -794,25 +1005,27 @@ class Simulation:
         sp = self.sp[idx].astype(int)
         intent = self.intent[idx]
         # Plankton grazing.
-        grazers = np.array([("plankton" in SPECIES[s].diet) for s in sp]) & \
-            np.isin(intent, [I["forage"], I["drift"], I["school"]])
+        no_eat = self._no_eat_mask[intent]
+        grazers = self._grazer_sp[sp] & ~no_eat & ~self.sleeping[idx]
         if grazers.any():
             g_idx = idx[grazers]
-            rate = np.where(self.intent[g_idx] == I["school"], 0.015, 0.05)
+            # Satiety: a full fish stops grazing, so a large school does not strip the water for nothing.
+            appetite = np.clip((1.0 - self.energy[g_idx]) / 0.3, 0.0, 1.0)
+            rate = np.where(np.isin(self.intent[g_idx], [I["forage"], I["drift"]]), 0.03, 0.004) * appetite
             got = self.plankton.consume(self.pos[g_idx], rate, dt)
             yields = np.array([SPECIES[self.sp[k]].diet["plankton"] for k in g_idx])
-            gain = got * yields * 0.45
+            gain = got * yields * 0.75
             self.energy[g_idx] = np.minimum(1.0, self.energy[g_idx] + gain)
             self.reward[g_idx] += gain * 8.0
             self.eating[g_idx] = got > 0.0005
         # Particles: nearest edible particle within reach, vectorised; bites applied per eater.
         if len(self.particles):
-            ok_intent = np.isin(intent, self._eat_intents)
+            ok_intent = ~no_eat & ~self.sleeping[idx] & (self.energy[idx] < 0.98)
             eaters = idx[ok_intent & self._eats_particles[sp]]
             if len(eaters):
                 d = np.linalg.norm(self.pos[eaters][:, None, :] - self.particles.pos[None, :, :], axis=2)
                 edible = self._edible[self.sp[eaters]][:, self.particles.kind]        # (eaters, particles)
-                reach = self._sp_arr["radius"][self.sp[eaters]] + 0.8
+                reach = self._sp_arr["radius"][self.sp[eaters]] + np.where(self._bottom[self.sp[eaters]], 1.2, 0.8)
                 d = np.where(edible & (d <= reach[:, None]), d, np.inf)
                 j = d.argmin(axis=1)
                 got = np.isfinite(d[np.arange(len(eaters)), j])
@@ -847,16 +1060,24 @@ class Simulation:
             # One lunge, then a refractory pause whatever the outcome.
             self.strike_cd[h] = 2.0
             self.stamina[h] = max(0.0, self.stamina[h] - 0.15)
+            self.attempts[h] += 1
+            self.reward[prey] -= 0.6              # a lunge: the strongest lesson a survivor gets
             p_catch = 0.4 if self.burst[h] else 0.12
             if self.burst[prey]:
                 p_catch *= 0.5
             if self.in_cover[prey]:
-                p_catch *= 0.3
+                p_catch *= 0.12                   # a refuge: grotto, crevice, overhang, sand
             if self.school_n[prey] >= 4:
                 p_catch *= 0.4                    # confusion effect of a dense school
-            if self.prng.random() > p_catch:
-                self.reward[prey] += 0.2          # escaped
+            # Rare prey is hard to find and wary (type III functional response): this is what keeps a
+            # hunted species from being eaten out regardless of what the brains learn.
+            p_catch *= self._prey_density_factor(ps)
+            caught = self.prng.random() <= p_catch
+            self.insights.on_lunge(self, int(h), prey, caught)
+            if not caught:
+                self.reward[h] -= 0.1             # a wasted lunge costs
                 continue
+            self.catches[h] += 1
             gain = ps.body_content * hs.diet.get(ps.id, 0.0) * (0.5 + 0.5 * max(0.0, self.energy[prey]))
             self.energy[h] = min(1.0, self.energy[h] + gain)
             self.reward[h] += 0.5 + gain * 4.0
@@ -879,11 +1100,33 @@ class Simulation:
                 continue
             if np.linalg.norm(self.pos[a] - self.pos[b]) > 2.0 + s.radius * 2:
                 continue
-            if self.count(s.id) >= self.cap(s) or (s.brain == "nowa" and self.nowa_count() >= self.max_nowa()):
+            n, cap = self.count(s.id), self.cap(s)
+            if n >= cap or (s.brain == "nowa" and self.nowa_count() >= self.max_nowa()):
                 continue
             if INTENTS[self.intent[a]] in ("flee", "strike", "chase") or INTENTS[self.intent[b]] in ("flee", "strike"):
                 continue
+            # Logistic fecundity: crowding near the ceiling suppresses breeding before food runs out.
+            if self.prng.random() < (n / cap) ** 2:
+                self.cooldown[a] = self.cooldown[b] = 0.05 * DAY_S
+                continue
+            # Predators breed only when their prey base can carry another mouth.
+            if not self._prey_base_ok(s):
+                self.cooldown[a] = self.cooldown[b] = 0.1 * DAY_S
+                continue
             self._make_child(int(a), b)
+
+    PREY_PER_PREDATOR = {"needlejaw": 2.5, "shade": 2.5}
+
+    def _prey_base_ok(self, s: Species) -> bool:
+        need = self.PREY_PER_PREDATOR.get(s.id)
+        if not need:
+            return True
+        prey = sum(self.count(pid) * min(1.0, w * 2) for pid, w in s.diet.items() if pid in BY_ID)
+        return prey >= need * (self.count(s.id) + 1)
+
+    def _prey_density_factor(self, prey: Species) -> float:
+        expected = max(2.0, prey.target * max(self.cfg.scale, 0.05))
+        return float(np.clip(self.count(prey.id) / (0.6 * expected), 0.1, 1.0))
 
     def _make_child(self, a: int, b: int):
         s = SPECIES[self.sp[a]]
@@ -892,7 +1135,9 @@ class Simulation:
         if s.brain == "nowa":
             ia = self.pool.inheritance(int(self.cid[a])) or {}
             ib = self.pool.inheritance(int(self.cid[b])) or {}
-            ga, gb = ia.get("genome"), ib.get("genome")
+            # The host knows the genomes; the workers are asked only for the epigenomes (skipped if busy).
+            ga = self.meta[a].get("genome") or ia.get("genome")
+            gb = self.meta[b].get("genome") or ib.get("genome")
             if self.cfg.brain_kind == "nowa" and ga and gb:
                 genome = na.child_genome(ga, gb, self.prng)
                 epi = na.blend_epigenomes(ia.get("epigenome"), ib.get("epigenome"), self.prng)
@@ -905,17 +1150,18 @@ class Simulation:
         body = {"speed": mix(self.speed_g), "vision": mix(self.vision_g), "metabolism": mix(self.metab_g)}
         pos = (self.pos[a] + self.pos[b]) / 2
         gen = int(max(self.gen[a], self.gen[b]) + 1)
+        caste = self.meta[a].get("caste", "plastic")
         cid = self.spawn(s.id, pos=pos, genome=genome, epigenome=epi, body=body,
-                         parents=(int(self.cid[a]), int(self.cid[b])), generation=gen, energy=0.55)
+                         parents=(int(self.cid[a]), int(self.cid[b])), generation=gen, energy=0.55, caste=caste)
         slot = self.slot_of[cid]
         self.age[slot] = 0.0
         for _ in range(s.litter - 1):
-            if self.count(s.id) >= self.cap(s):
+            if self.count(s.id) >= self.cap(s) or not self.has_room(s):
                 break
-            g2 = na.child_genome(ia.get("genome"), ib.get("genome"), self.prng) if (
+            g2 = na.child_genome(ga, gb, self.prng) if (
                 s.brain == "nowa" and self.cfg.brain_kind == "nowa" and genome) else genome
             c2 = self.spawn(s.id, pos=pos + self.rng.normal(0, 0.3, 3), genome=g2, epigenome=epi, body=body,
-                            parents=(int(self.cid[a]), int(self.cid[b])), generation=gen, energy=0.55)
+                            parents=(int(self.cid[a]), int(self.cid[b])), generation=gen, energy=0.55, caste=caste)
             self.age[self.slot_of[c2]] = 0.0
             self.births += 1
         for p in (a, b):
@@ -948,7 +1194,7 @@ class Simulation:
                 self.age[self.slot_of[cid]] = 0.0
                 self.births += 1
 
-    SNOW_RATE = 0.1        # detritus flakes per second from plankton turnover (scaled by plankton biomass)
+    SNOW_RATE = 0.16       # detritus flakes per second from plankton turnover (scaled by plankton biomass)
 
     def _marine_snow(self, dt: float):
         expected = self.SNOW_RATE * dt * min(1.5, self.plankton.rho.mean() / 0.35)
@@ -967,6 +1213,7 @@ class Simulation:
             if s.id not in self.extinct_since:
                 self.extinct_since[s.id] = self.time
                 self.events.append({"t": "event", "kind": "extinct", "species": s.id})
+                self.insights.on_extinct(self, s.id)
                 continue
             if not self.cfg.repop_enabled or self.time - self.extinct_since[s.id] < self.cfg.repop_delay_s:
                 continue
@@ -980,20 +1227,162 @@ class Simulation:
         use_archive = self.cfg.repop_mode == "archive" and arch and s.brain == "nowa" and self.cfg.brain_kind == "nowa"
         center = self.random_open_point(s)
         for k in range(n):
+            if not self.has_room(s):
+                break
             genome = body = None
             gen = 0
             if use_archive:
                 e = arch[k % len(arch)]
                 genome = na.child_genome(e["genome"], arch[(k + 1) % len(arch)]["genome"], self.prng, 0.08)
                 body, gen = e.get("body"), int(e.get("generation", 0)) + 1
+                epi = e.get("epigenome")
+            else:
+                epi = None
             self.spawn(species_id, pos=center + self.rng.normal(0, 1.0, 3) * [1, 0.3, 1], genome=genome, body=body,
-                       generation=gen, energy=0.8, age_frac=0.25)
+                       epigenome=epi, generation=gen, energy=0.8, age_frac=0.25)
         self.events.append({"t": "event", "kind": "repopulate", "species": species_id, "n": n,
                             "mode": "archive" if use_archive else "fresh"})
+        self.insights.on_repopulate(self, species_id, n, "archive" if use_archive else "fresh")
+
+    # ----- lineage ----------------------------------------------------------------------------------------
+    LINEAGE_MAX = 4000
+
+    def _register_birth(self, cid: int, species_id: str, generation: int, parents) -> None:
+        ps = [int(p) for p in parents if p]
+        self.lineage[cid] = {"id": cid, "species": species_id, "gen": int(generation), "parents": ps,
+                             "born": round(self.time, 1), "died": None, "cause": None, "children": []}
+        for p in ps:
+            if p in self.lineage:
+                self.lineage[p]["children"].append(cid)
+        if len(self.lineage) > self.LINEAGE_MAX:
+            # Drop the oldest dead records first; living creatures and their parents stay.
+            alive = set(self.slot_of)
+            for old in list(self.lineage)[: len(self.lineage) - self.LINEAGE_MAX]:
+                if old not in alive:
+                    del self.lineage[old]
+
+    def family(self, cid: int, up: int = 4, down: int = 3) -> Optional[dict]:
+        """Ancestors up to ``up`` generations and descendants down to ``down`` generations of one creature."""
+        if cid not in self.lineage:
+            return None
+        nodes: Dict[int, dict] = {}
+
+        def add(i):
+            r = self.lineage.get(i)
+            if r is not None:
+                nodes[i] = {**r, "alive": i in self.slot_of, "children": list(r["children"])}
+            return r
+
+        frontier = [cid]
+        add(cid)
+        for _ in range(up):
+            nxt = []
+            for i in frontier:
+                for p in (self.lineage.get(i) or {}).get("parents", []):
+                    if p not in nodes and add(p):
+                        nxt.append(p)
+            frontier = nxt
+        frontier = [cid]
+        for _ in range(down):
+            nxt = []
+            for i in frontier:
+                for c in (self.lineage.get(i) or {}).get("children", []):
+                    if c not in nodes and add(c):
+                        nxt.append(c)
+            frontier = nxt
+        return {"t": "lineage", "id": cid, "nodes": list(nodes.values())}
+
+    # ----- learning statistics --------------------------------------------------------------------------
+    _GEN_KEYS = ("dead", "eaten", "age", "rsum", "rn", "attempts", "catches", "encounters", "escapes",
+                 "th_n", "th_ok", "hu_n", "hu_ok", "pr_n", "pr_ok")
+    _Q_KEYS = ("th_n", "th_ok", "hu_n", "hu_ok", "pr_n", "pr_ok")
+    EVASIVE = {"flee", "hide", "burrow"}
+    HUNT = {"strike", "chase", "stalk"}
+    FEED = {"forage", "scavenge", "ambush", "stalk", "chase", "strike", "patrol"}
+
+    def _score_choice(self, slot: int, tokens, action: str) -> None:
+        """Count situations and whether the choice fit them (the same yardstick for NOWA and the baselines)."""
+        t = set(tokens)
+        q = self.q_counts[slot]
+        if "threat:near" in t:
+            q[0] += 1
+            q[1] += action in self.EVASIVE
+        elif "energy:low" in t and ({"food:near", "food:far", "prey:near", "prey:far"} & t):
+            q[2] += 1
+            q[3] += action in self.FEED
+        elif "prey:near" in t and "stamina:low" not in t:
+            q[4] += 1
+            q[5] += action in self.HUNT
+
+    def _record_generation(self, slot: int, cause: str) -> None:
+        s = SPECIES[self.sp[slot]]
+        g = self.gen_stats[s.id].setdefault(str(int(self.gen[slot])), {k: 0 for k in self._GEN_KEYS})
+        g["dead"] += 1
+        g["eaten"] += int(cause == "eaten")
+        g["age"] += float(self.age[slot]) / DAY_S
+        g["rsum"] += float(self.reward_sum[slot])
+        g["rn"] += int(self.reward_n[slot])
+        for k in ("attempts", "catches", "encounters", "escapes"):
+            g[k] += int(getattr(self, k)[slot])
+        for i, k in enumerate(self._Q_KEYS):
+            g[k] = g.get(k, 0) + int(self.q_counts[slot, i])
+
+    def learning_summary(self, max_gens: int = 12) -> Dict[str, list]:
+        """Per species and generation: lifespan, reward per decision, hunting and escape success.
+
+        Shows whether later generations (genome, epigenome and their own sleep-consolidated learning) do better.
+        """
+        out: Dict[str, list] = {}
+        for s in SPECIES:
+            if s.brain != "nowa":
+                continue
+            acc: Dict[int, dict] = {int(k): dict(v) for k, v in self.gen_stats[s.id].items()}
+            alive = np.nonzero(self.alive & (self.sp == s.index))[0]
+            for slot in alive:
+                g = acc.setdefault(int(self.gen[slot]), {k: 0 for k in self._GEN_KEYS})
+                g["alive"] = g.get("alive", 0) + 1
+                g["rsum"] += float(self.reward_sum[slot])
+                g["rn"] += int(self.reward_n[slot])
+                for k in ("attempts", "catches", "encounters", "escapes"):
+                    g[k] += int(getattr(self, k)[slot])
+                for i, k in enumerate(self._Q_KEYS):
+                    g[k] = g.get(k, 0) + int(self.q_counts[slot, i])
+            rows = []
+            for gen in sorted(acc)[-max_gens:]:
+                g = acc[gen]
+                dead = g["dead"]
+                rows.append({
+                    "gen": gen, "dead": dead, "alive": g.get("alive", 0),
+                    "age_days": round(g["age"] / dead, 3) if dead else None,
+                    "reward": round(g["rsum"] / g["rn"], 4) if g["rn"] else None,
+                    "catch": round(g["catches"] / g["attempts"], 3) if g["attempts"] else None,
+                    "escape": round(g["escapes"] / g["encounters"], 3) if g["encounters"] else None,
+                    "eaten": round(g["eaten"] / dead, 3) if dead else None,
+                    "decisions": int(g["rn"]),
+                    "evade": round(g.get("th_ok", 0) / g["th_n"], 3) if g.get("th_n") else None,
+                    "feed": round(g.get("hu_ok", 0) / g["hu_n"], 3) if g.get("hu_n") else None,
+                    "hunt": round(g.get("pr_ok", 0) / g["pr_n"], 3) if g.get("pr_n") else None,
+                })
+            out[s.id] = rows
+        return out
 
     # ----- user tools -----------------------------------------------------------------------------------
+    def clamp_point(self, pos) -> Optional[np.ndarray]:
+        """A finite point clamped into the water, or None for garbage input."""
+        try:
+            p = np.asarray(pos, dtype=float).reshape(3)
+        except Exception:  # noqa: BLE001
+            return None
+        if not np.isfinite(p).all():
+            return None
+        t = self.tank
+        return np.clip(p, [-t.half_x + 0.5, -t.depth + 0.5, -t.half_z + 0.5], [t.half_x - 0.5, -0.3, t.half_z - 0.5])
+
     def feed(self, pos, n: int = 30):
-        p = np.asarray(pos, dtype=float)
+        p = self.clamp_point(pos)
+        if p is None:
+            raise ValueError("bad position")
+        n = int(max(1, min(200, n)))
         p[1] = min(p[1], -0.5)
         pts = p + self.rng.normal(0, 0.8, (n, 3)) * [1, 0.3, 1]
         self.particles.add(pts, PARTICLE_FOOD, 0.08)
@@ -1047,7 +1436,8 @@ class Simulation:
                 "lifespan_days": round(float(self.lifespan[slot] / DAY_S), 2),
                 "energy": round(float(self.energy[slot]), 3), "stamina": round(float(self.stamina[slot]), 3),
                 "intent": INTENTS[self.intent[slot]], "sleeping": bool(self.sleeping[slot]),
-                "in_cover": bool(self.in_cover[slot]), "tokens": list(m["tokens"]), "mode": m.get("mode", ""),
+                "in_cover": bool(self.in_cover[slot]), "tokens": list(m["tokens"]), "caste": m.get("caste", "plastic"),
+                "senses": list(m.get("senses") or m["tokens"]), "mode": m.get("mode", ""),
                 "target": int(self.cid[tgt]) if tgt >= 0 and self.alive[tgt] else None,
                 "vision": round(float(s.vision * self.vision_g[slot]), 2), "fov_deg": s.fov_deg,
                 "parents": m["parents"], "children": int(self.children[slot]), "decisions": int(self.decisions[slot]),

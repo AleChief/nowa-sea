@@ -1,5 +1,5 @@
 # Start the NOWA Sea server and open the aquarium in the browser. Extra args go to the server
-# (python -m nowasea.server --help), e.g.:  scripts\run.ps1 -- --agents-scale 0.25 --brain-workers 2
+# (python -m nowasea.server --help), e.g.:  scripts\run.ps1 -- --new --scale 0.25 --brain-workers 2
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root

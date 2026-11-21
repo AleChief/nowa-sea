@@ -22,48 +22,82 @@ from nowasea.ecosystem.sim import day_phase, light_level
 log = logging.getLogger("nowasea.sim")
 
 SPEEDS = (0.0, 1.0, 2.0, 5.0, 10.0)
+AUTOSAVE = "autosave"
 FRAME_DT = 0.05            # publish creature frames at 20 Hz wall
 MAX_LAG_SIM_S = 1.5        # brains may lag at most this much simulated time before the world waits
 MAX_STEPS_PER_TICK = 60
 
 
-def default_workers() -> int:
+def default_workers(scale: float = 1.0) -> int:
+    """Brain processes for a population scale: 2 up to half the targets, 5 for the full aquarium.
+
+    Measured on a 14-core laptop already ~30-50 % busy: full scale (≈60 NOWA agents) keeps ~10x with 4 workers,
+    about 5x with 2. Never more than a quarter of the logical CPUs by default.
+    """
     n = os.cpu_count() or 4
-    return max(1, min(2, n // 4))   # the default leaves most cores to other work; raise with --brain-workers
+    want = 2 if scale <= 0.5 else 5
+    return max(1, min(want, n // 4))
 
 
 class SimSource:
     def __init__(self, seed: int = 7, scale: float = 1.0, workers: int = 0, saves_dir: Optional[str] = None,
                  load_slot: Optional[str] = None, speed: float = 1.0, brain_kind: str = "nowa",
-                 hippocampus: Optional[int] = None):
+                 hippocampus: Optional[int] = None, resume: bool = False, autosave_min: float = 0.0,
+                 control_share: Optional[float] = None):
         self.brain_kind = brain_kind
-        self.workers = workers or default_workers()
+        self.workers = workers or default_workers(scale)
         self.pool = BrainPool(kind=brain_kind, workers=self.workers)
         self.store = SaveStore(Path(saves_dir) if saves_dir else None)
         self.cfg = SimConfig(seed=seed, scale=scale, brain_kind=brain_kind)
         if hippocampus:
             self.cfg.hippocampus_capacity = int(hippocampus)
-        self.sim = Simulation(self.cfg, self.pool)
+        if control_share is not None:
+            self.cfg.control_share = min(0.9, max(0.0, float(control_share)))
         self.world_id = uuid.uuid4().hex[:8]
         self.speed = float(speed)
         self.turbo = False
         self.achieved = 0.0
-        self.autosave_s = 0.0
+        self.autosave_s = max(0.0, float(autosave_min)) * 60.0
+        self.resumed_from: Optional[str] = None
+        self._selected: set[int] = set()
+        # The "eternal" aquarium: continue the last autosave unless told to start a new world.
+        self.sim = None
+        candidates = [load_slot] if load_slot else ([AUTOSAVE, "autosave.prev"] if resume else [])
+        for slot in candidates:
+            if not self.store.path(slot).is_file():
+                continue
+            try:
+                self.store.validate(slot, self.brain_kind)
+                self._load(slot)
+                self.resumed_from = slot
+                log.info("continuing world from save %r (sim day %.2f)", slot, self.sim.time / DAY_S)
+                break
+            except Exception as exc:  # noqa: BLE001
+                if load_slot:
+                    raise
+                moved = self.store.quarantine(slot)
+                log.error("could not continue from %r (%s); moved it to %s", slot, exc, moved)
+                self.pool.reset()
+                self.sim = None
+        if self.sim is None:
+            self.sim = Simulation(self.cfg, self.pool)
         self._last_autosave_sim = self.sim.time
         self._cmds: "queue.Queue[tuple[dict, Future]]" = queue.Queue()
         self._lock = threading.Lock()
         self._frame = b""
         self._plankton = P.plankton_frame(self.sim.plankton.rho)
         self._stats = {}
+        self._insights = None
         self._inspect = {}
         self._events = []
-        self._selected: set[int] = set()
         self._stop = False
         self._thread: Optional[threading.Thread] = None
         self.seq = 0
         self.lag_waits = 0
-        if load_slot:
-            self._load(load_slot)
+        self.debug_commands = bool(os.environ.get("NOWASEA_DEBUG_COMMANDS"))
+        self.error: Optional[str] = None
+        self._error_at = 0.0
+        self._started_sim_time = self.sim.time
 
     # ----- interface used by the hub (any thread) -----------------------------------------------------
     def hello(self) -> dict:
@@ -71,7 +105,16 @@ class SimSource:
         return {"t": "hello", "protocol": P.PROTOCOL, "world_id": self.world_id, "tank": sim.tank.describe(),
                 "species": [s.describe() for s in SPECIES], "intents": INTENTS, "day_s": DAY_S,
                 "plankton": {"nx": sim.plankton.nx, "ny": sim.plankton.ny, "nz": sim.plankton.nz},
-                "settings": self._settings()}
+                "settings": self._settings(), "genes": self._genes()}
+
+    def _genes(self):
+        if self.brain_kind != "nowa":
+            return []
+        if not hasattr(self, "_gene_cache"):
+            from nowasea.brains import nowa_adapter as na
+
+            self._gene_cache = na.gene_registry()
+        return self._gene_cache
 
     def floor_frame(self) -> bytes:
         return P.floor_frame(self.sim.tank.floor)
@@ -91,9 +134,12 @@ class SimSource:
     def inspect(self, cid) -> Optional[dict]:
         if not cid:
             return None
-        self._selected.add(int(cid))
         with self._lock:
             return self._inspect.get(int(cid))
+
+    def insights(self) -> Optional[dict]:
+        with self._lock:
+            return self._insights
 
     def pop_events(self):
         with self._lock:
@@ -123,11 +169,37 @@ class SimSource:
     def stop(self):
         self._stop = True
         if self._thread:
-            self._thread.join(timeout=5)
+            self._thread.join(timeout=10)
+        # Leave the world where it was: the next start continues from here.
+        if self.autosave_s > 0 and self.sim is not None and self.sim.time - self._started_sim_time > 1.0 \
+                and not self.error:
+            try:
+                info = self.store.save(AUTOSAVE, self.sim, self.pool)
+                log.info("autosaved on shutdown (%d creatures, %.1f MB)", info["creatures"], info["size"] / 2**20)
+            except Exception:  # noqa: BLE001
+                log.exception("autosave on shutdown failed")
         self.pool.close()
 
     # ----- simulation thread ------------------------------------------------------------------------------
     def _run(self):
+        """Keeps the thread alive on errors: a crash is reported in stats/toasts instead of a silent freeze."""
+        while not self._stop:
+            try:
+                self._loop()
+            except Exception as exc:  # noqa: BLE001
+                log.exception("simulation loop crashed")
+                self.error = f"{type(exc).__name__}: {exc}"
+                with self._lock:
+                    self._events.append({"t": "toast", "level": "error",
+                                         "text": {"ru": f"Сбой симуляции: {self.error}",
+                                                  "en": f"Simulation failure: {self.error}"}})
+                    self._stats = {**self._stats, "error": self.error}
+                self.speed = 0.0
+                self.turbo = False
+                self._error_at = time.time()
+                time.sleep(1.0)
+
+    def _loop(self):
         last = time.perf_counter()
         last_frame = 0.0
         last_stats = 0.0
@@ -168,17 +240,27 @@ class SimSource:
             if self.autosave_s > 0 and sim.time - self._last_autosave_sim >= self.autosave_s:
                 self._last_autosave_sim = sim.time
                 try:
-                    self.store.save("autosave", sim, self.pool)
+                    self.store.save(AUTOSAVE, sim, self.pool)
                 except Exception:  # noqa: BLE001
                     log.exception("autosave failed")
-            if now - last_frame >= (0.5 if self.turbo else FRAME_DT):
+            if now - last_frame >= (0.2 if self.turbo else FRAME_DT):
                 last_frame = now
                 self._publish()
-            if now - last_inspect >= 0.25:
+            if now - last_inspect >= 1.0:
                 last_inspect = now
                 self._refresh_inspect()
+            if now - getattr(self, "_last_insights", 0.0) >= 5.0:
+                self._last_insights = now
+                try:
+                    ins = self.sim.insights.summary(self.sim)
+                    with self._lock:
+                        self._insights = ins
+                except Exception:  # noqa: BLE001
+                    log.exception("insights summary failed")
             if now - last_stats >= 1.0:
                 last_stats = now
+                if self.error and time.time() - self._error_at > 30.0:
+                    self.error = None                # recovered: the loop has run cleanly for 30 s
                 self._refresh_stats()
             spent = time.perf_counter() - now
             time.sleep(max(0.001, 0.01 - spent))
@@ -194,7 +276,8 @@ class SimSource:
 
     def _publish(self):
         sim = self.sim
-        sim.selected = next(iter(self._selected), 0) if self._selected else 0
+        sel = self._selected
+        sim.selected = next(iter(sel), 0) if sel else 0
         phase = day_phase(sim.time)
         speed_set = self.achieved if self.turbo else self.speed
         frame = P.state_frame(self.seq, sim.time, speed_set, self.achieved, phase, light_level(phase),
@@ -209,13 +292,15 @@ class SimSource:
             if sim.events:
                 self._events.extend(sim.events[-50:])
                 sim.events.clear()
+                del self._events[:-200]            # nobody listening: keep only the recent ones
 
     def _refresh_inspect(self):
         out = {}
-        for cid in list(self._selected):
+        sel = set(self._selected)
+        for cid in sel:
             info = self.sim.describe_creature(cid)
             if info is None:
-                self._selected.discard(cid)
+                self._selected = self._selected - {cid}
                 continue
             if BY_ID[info["species"]].brain == "nowa":
                 try:
@@ -225,6 +310,19 @@ class SimSource:
                 if brain:
                     info["brain"] = brain
                     info["mode"] = brain.get("mode") or info.get("mode", "")
+                # The genome does not change during a life: fetch it once per creature.
+                cache = self.__dict__.setdefault("_genome_cache", {})
+                if cid not in cache:
+                    try:
+                        inh = self.pool.inheritance(cid) or {}
+                        cache[cid] = {"genome": inh.get("genome"),
+                                      "epigenome_size": len(((inh.get("epigenome") or {}).get("patterns")) or [])}
+                    except Exception:  # noqa: BLE001
+                        cache[cid] = None
+                    if len(cache) > 200:
+                        cache.pop(next(iter(cache)))
+                if cache.get(cid):
+                    info.update(cache[cid])
             out[cid] = info
         with self._lock:
             self._inspect = out
@@ -235,16 +333,19 @@ class SimSource:
                    for k, v in sim.extinct_since.items()}
         stats = {"t": "stats", "time": sim.time, "day": sim.time / DAY_S, "pop": sim.populations(),
                  "history": sim.history[-360:], "births": sim.births, "deaths": sim.deaths, "extinct": extinct,
+                 "births_species": sim.births_sp, "deaths_species": sim.deaths_sp,
                  "brains": {**self.pool.load_stats(), "lag_waits": self.lag_waits},
                  "speed": {"set": "turbo" if self.turbo else self.speed, "achieved": round(self.achieved, 2)},
                  "generation_max": sim.max_generation(), "plankton": round(float(sim.plankton.rho.mean()), 3),
+                 "error": self.error, "learning": sim.learning_summary(), "resumed_from": self.resumed_from,
                  "particles": len(sim.particles), "settings": self._settings()}
         with self._lock:
             self._stats = stats
 
     def _settings(self) -> dict:
         c = self.sim.cfg
-        return {"repopulate": {"enabled": c.repop_enabled, "delay_s": c.repop_delay_s, "mode": c.repop_mode},
+        return {"control_share": c.control_share,
+                "repopulate": {"enabled": c.repop_enabled, "delay_s": c.repop_delay_s, "mode": c.repop_mode},
                 "autosave_s": self.autosave_s, "scale": c.scale, "workers": self.workers, "brain": self.brain_kind}
 
     # ----- commands (simulation thread) ----------------------------------------------------------------
@@ -284,11 +385,19 @@ class SimSource:
             if sid not in BY_ID:
                 raise ValueError(f"unknown species {sid}")
             s = BY_ID[sid]
-            if sim.count(sid) >= sim.cap(s):
+            if sim.count(sid) >= sim.cap(s) or not sim.has_room(s):
                 return {"t": "toast", "level": "info", "text": {"ru": f"{s.name_ru}: достигнут потолок {sim.cap(s)}",
                                                                 "en": f"{s.name_en}: cap {sim.cap(s)} reached"}}
-            cid = sim.spawn(sid, pos=msg.get("pos"), energy=0.8, age_frac=0.2)
+            pos = sim.clamp_point(msg["pos"]) if msg.get("pos") is not None else None
+            cid = sim.spawn(sid, pos=pos, energy=0.8, age_frac=0.2)
             return {"t": "spawned", "id": cid, "species": sid}
+        if t == "heatmap":
+            return sim.insights.heatmap(str(msg.get("species")))
+        if t == "insights":
+            return sim.insights.summary(sim)
+        if t == "lineage":
+            fam = sim.family(int(msg.get("id") or 0), int(msg.get("up", 4)), int(msg.get("down", 3)))
+            return fam or {"t": "lineage", "id": msg.get("id"), "nodes": []}
         if t == "list_saves":
             return {"t": "saves", "items": self.store.list()}
         if t == "save":
@@ -298,7 +407,8 @@ class SimSource:
             info["seconds"] = round(time.perf_counter() - t0, 2)
             return [{"t": "saved", **info}, {"t": "saves", "items": self.store.list()}]
         if t == "load":
-            self._load(msg["slot"])
+            self.store.validate(msg["slot"], self.brain_kind)    # fails here without touching the world
+            self._safe_load(msg["slot"])
             return [{"t": "hello"}, {"t": "toast", "level": "info",
                                      "text": {"ru": f"Загружено: {msg['slot']}", "en": f"Loaded: {msg['slot']}"}}]
         if t == "delete_save":
@@ -317,13 +427,16 @@ class SimSource:
             return {"t": "settings", **self._settings()}
         if t == "new_world":
             self.pool.reset()
-            self.pool.created_genomes.clear()
-            cfg = SimConfig(seed=int(msg.get("seed", self.cfg.seed)), scale=self.cfg.scale, brain_kind=self.brain_kind)
+            self.pool.created.clear()
+            from dataclasses import replace
+
+            cfg = replace(self.sim.cfg, seed=int(msg.get("seed", self.cfg.seed)))
             self.sim = Simulation(cfg, self.pool)
+            self.cfg = cfg
             self.world_id = uuid.uuid4().hex[:8]
             self._selected.clear()
             return {"t": "hello"}
-        if t == "kill_species":          # test hook: force an extinction
+        if t == "kill_species" and self.debug_commands:   # test hook: force an extinction
             sid = msg["species"]
             for slot in list(sim.slot_of.values()):
                 if sim.sp[slot] == BY_ID[sid].index:
@@ -331,9 +444,28 @@ class SimSource:
             return None
         raise ValueError(f"unknown command {t}")
 
+    def _safe_load(self, slot: str):
+        """Load a slot; if anything fails after the old world was dropped, bring the old world back."""
+        from nowasea.persistence.saves import RESTORE_SLOT
+
+        had_world = self.sim is not None
+        if had_world:
+            self.store.save(RESTORE_SLOT, self.sim, self.pool)
+        try:
+            self._load(slot)
+        except Exception:
+            if had_world:
+                log.exception("loading %r failed; restoring the previous world", slot)
+                self._load(RESTORE_SLOT)
+            raise
+        finally:
+            try:
+                self.store.path(RESTORE_SLOT).unlink(missing_ok=True)
+            except Exception:  # noqa: BLE001
+                pass
+
     def _load(self, slot: str):
         self.pool.reset()
-        self.pool.created_genomes.clear()
 
         def factory(state):
             from dataclasses import fields

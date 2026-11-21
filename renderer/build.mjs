@@ -9,7 +9,7 @@ import { transformSync } from 'esbuild';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 // one shared scope: concatenation order matters (top-level code of a file may only use what earlier files define)
-const FILES = ['quality.js', 'math.js', 'shaders.js', 'world.js', 'creatures.js', 'camera.js', 'net.js', 'main.js', 'audio.js', 'hud.js', 'boot.js'];
+const FILES = ['quality.js', 'math.js', 'shaders.js', 'world.js', 'creatures.js', 'camera.js', 'director.js', 'net.js', 'main.js', 'audio.js', 'hud.js', 'insights.js', 'boot.js'];
 const readable = process.argv.includes('--readable');
 
 let js = FILES.map((f) => `// ---- ${f}\n` + readFileSync(path.join(here, 'src', f), 'utf8')).join('\n');

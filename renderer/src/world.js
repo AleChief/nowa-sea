@@ -73,7 +73,7 @@ function makeWorld(D, T, tank) {
   const solid = (mesh, x, y, z, sc, q, mat, seed, ts = 1, bob = 0) => { (mesh > 3 && mesh < 10 ? props[mesh - 4][cellOf(x, z)] : (solids[mesh] ||= [])).push(x, y, z, sc, q[0], q[1], q[2], q[3], mat, seed, ts, bob); };
   const chunks = Array.from({ length: NCHUNK }, () => Array.from({ length: nCells }, () => []));
   const glints = [];
-  const bubbles = [], kelpAbs = new Float32Array((NX / 2) * (NY / 2) * (NZ / 2));
+  const bubbles = [], kelpAbs = new Float32Array((NX / 2) * (NY / 2) * (NZ / 2)), kelpCols = [];
   // in the water, clear of the glass (and its rock section) by m metres
   const inside = (x, y, z, m = 0.5) => abs(x) < hx - m && abs(z) < hz - m && y > -dep + 0.3 && y < -0.5;
 
@@ -130,6 +130,7 @@ function makeWorld(D, T, tank) {
 
   // --- kelp columns
   const column = (x, y, z, H, kind, dens = 1) => {
+    kelpCols.push(x, z, y, y + H); // for picking: kelp hides what is behind it
     const strands = 2 + (rnd() < 0.6) + (rnd() < 0.3), ph = rnd() * TAU, tw = rr(0.1, 0.28), sr = rr(0.2, 0.55), sc = rr(0.75, 1.25);
     const la = rnd() * TAU, lm = rr(0, 0.11), full = rr(0.55, 1.3) * dens;
     const stem = (s, h) => { const a = ph + s * TAU / strands + h * tw, r = sr * (1 - 0.6 * h / H), ln = lm * h * h / H; return [x + cos(a) * r + cos(la) * ln, z + sin(a) * r + sin(la) * ln, a]; };
@@ -355,7 +356,7 @@ function makeWorld(D, T, tank) {
     return { data, n, start, lo, hi };
   };
   return { gy, glints: new Float32Array(glints.length ? glints : [0, -1e4, 0, 0, 0, 0, 0, 0]), chunks: chunks.map(packC), props: props.map(packC), big: pack(big), bigF: pack(big, 2, 1.5), small: pack(small),
-    solids: { data: new Float32Array(sol.data), ranges: sol.ranges }, bubbles: new Float32Array(bubbles.length ? bubbles : [0, -1e4, 0, 0, 0, 1, 1, 0]), volD, gm, snow, plank };
+    solids: { data: new Float32Array(sol.data), ranges: sol.ranges }, bubbles: new Float32Array(bubbles.length ? bubbles : [0, -1e4, 0, 0, 0, 1, 1, 0]), volD, gm, snow, plank, kelp: new Float32Array(kelpCols) };
 }
 
 const fract = (x) => x - floor(x);

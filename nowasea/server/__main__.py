@@ -20,8 +20,14 @@ def main(argv=None) -> int:
     p.add_argument("--saves", default=None, help="save directory (default: ./saves)")
     p.add_argument("--load", default=None, help="slot to load at start")
     p.add_argument("--speed", type=float, default=1.0)
-    p.add_argument("--brain", choices=("nowa", "stub"), default="nowa",
-                   help="stub = rule-based stand-in brains (fast UI/ecology debugging, no learning)")
+    p.add_argument("--brain", choices=("nowa", "stub", "reflex", "random"), default="nowa",
+                   help="nowa (default); stub = rule-based stand-ins for fast UI work; reflex / random = "
+                        "non-learning control groups for comparing against NOWA")
+    p.add_argument("--new", action="store_true", help="start a new world instead of continuing the autosave")
+    p.add_argument("--control-share", type=float, default=0.25,
+                   help="share of NOWA creatures in the frozen control caste (same brain, no learning); new worlds")
+    p.add_argument("--autosave-min", type=float, default=15.0,
+                   help="autosave every N simulated minutes and on shutdown (0 = off); the next start continues it")
     p.add_argument("-v", "--verbose", action="store_true")
     a = p.parse_args(argv)
     logging.basicConfig(level=logging.DEBUG if a.verbose else logging.INFO, format="%(asctime)s %(name)s: %(message)s")
@@ -36,7 +42,8 @@ def main(argv=None) -> int:
         from nowasea.server.sim_source import SimSource
 
         source = SimSource(seed=a.seed, scale=a.scale, workers=a.brain_workers, saves_dir=a.saves,
-                           load_slot=a.load, speed=a.speed, brain_kind=a.brain)
+                           load_slot=a.load, speed=a.speed, brain_kind=a.brain,
+                           resume=not a.new, autosave_min=a.autosave_min, control_share=a.control_share)
     serve(source, a.host, a.port, a.open)
     return 0
 

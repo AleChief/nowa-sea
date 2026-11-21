@@ -68,6 +68,8 @@ class BrainSpec:
     cortex_capacity: int = 128
     sleep_cycles: int = 3
     default_action: str = ""
+    replay_budget: int = 96                # core default 32 is too small for ~300 decisions between sleeps
+    frozen: bool = False                   # control caste: same core and drives, no learning (no rewards, no consolidation)
 
     def __post_init__(self):
         self.actions = [str(a) for a in self.actions]
@@ -103,6 +105,15 @@ def child_genome(mother: dict, father: dict, rng: random.Random, mutation_rate: 
     a, b = GenomeVector.from_dict(mother), GenomeVector.from_dict(father)
     child, _ = a.crossover(b, mode="uniform", rng=rng)
     return child.mutate(rate=mutation_rate, rng=rng).to_dict()
+
+
+def gene_registry() -> List[dict]:
+    """The 39 inheritable genes with module, range and description (static, for UIs)."""
+    ensure_nowa()
+    from genome import GENE_REGISTRY
+
+    return [{"key": d.key, "module": d.module, "min": d.min_val, "max": d.max_val, "default": d.default,
+             "description": d.description} for d in GENE_REGISTRY.values()]
 
 
 def genome_generation(genome: dict) -> int:
@@ -164,6 +175,18 @@ class DecisionInfo:
     action: str
     mode: str = ""
     no_action: bool = False
+    mood: Optional[tuple] = None      # valence, arousal, stress, cortisol, uncertainty — rides with the answer
+
+
+def _mood(agent) -> Optional[tuple]:
+    try:
+        ax = agent.affective_space.axes
+        out = agent._last_decision_arbitration_output or {}
+        return (round(float(ax.get("valence", 0.0)), 3), round(float(ax.get("arousal", 0.0)), 3),
+                round(float(ax.get("stress", 0.0)), 3), round(float(agent.neuromodulators.cortisol), 3),
+                round(float(out.get("global_uncertainty", 0.0) or 0.0), 3))
+    except Exception:  # noqa: BLE001
+        return None
 
 
 class NowaBrain:
@@ -195,10 +218,16 @@ class NowaBrain:
                 agent.affective_space.rng.seed(int(seed))
             except Exception:
                 pass
+        # Replay budget scaled to how much a creature lives through between sleeps (core default 32).
+        if agent.sleep_manager is not None:
+            agent.sleep_manager.replay_budget_per_sleep = int(spec.replay_budget)
+            if hasattr(agent.sleep_manager, "edpc_sac_energy_budget"):
+                agent.sleep_manager.edpc_sac_energy_budget = float(spec.replay_budget)
         self.agent = agent
         self._factory = factory
         self._prev_tokens: Optional[List[str]] = None
         self._prev_decided: Optional[str] = None
+        self._prev_ctx = (0.0, 0.0, 1.0)
         self.decisions = 0
         self.sleeps = 0
 
@@ -213,37 +242,60 @@ class NowaBrain:
         commit and the step then run with no extra time so the interval is not counted twice.
         """
         agent = self.agent
-        if elapsed > 0.0:
-            agent.advance_time(float(elapsed))
+        nov = min(1.0, max(0.0, float(novelty)))
+        conf = min(1.0, max(0.0, float(conflict)))
         if self._prev_tokens is not None and executed_prev:
-            r = float("nan") if reward_prev is None else max(-1.0, min(1.0, float(reward_prev)))
+            # Close the previous decision with the values it was made under (the core keys Q by them).
+            r = float("nan") if (reward_prev is None or self.spec.frozen) else max(-1.0, min(1.0, float(reward_prev)))
+            decided = self._prev_decided
+            overridden = executed_prev != decided
+            source = "host:default" if decided == NO_ACTION else ("host:body" if overridden else None)
             agent.commit_executed_transition(
                 action=str(executed_prev), reward=r, context_events=list(self._prev_tokens),
-                decided_action=self._prev_decided, overridden=(executed_prev != self._prev_decided),
-                override_source="host:body" if executed_prev != self._prev_decided else None,
-                novelty=novelty, conflict=conflict, intensity=intensity,
+                decided_action=decided, overridden=overridden, override_source=source,
+                novelty=self._prev_ctx[0], conflict=self._prev_ctx[1], intensity=self._prev_ctx[2],
             )
         ctx = [str(t) for t in tokens]
-        action = agent.step(context_events=ctx, reward=None, novelty=float(novelty), conflict=float(conflict),
+        # The interval goes to step(): it advances the host clock once and stores it for the next commit's
+        # affect appraisal. step(dt=0) after advance_time() froze affect at zero (the core integrates the
+        # commit's affect with the previous step's time_elapsed).
+        action = agent.step(context_events=ctx, reward=None, novelty=nov, conflict=conf,
                             intensity=float(intensity), decision_only=True, physiological_bias=bias or None,
-                            dt=0.0)
+                            dt=max(0.0, float(elapsed)))
         action = str(action) if action else NO_ACTION
         no_action = action == NO_ACTION or action not in self.spec.actions
+        decided = NO_ACTION if no_action else action
         if no_action:
-            action = self.spec.default_action
+            # The gate admitted nothing. The body acts on its strongest drive (or keeps going), and the next
+            # commit tells the core that the host chose, not the brain.
+            if bias:
+                best = max(bias.items(), key=lambda kv: kv[1])
+                action = best[0] if best[0] in self.spec.actions else self.spec.default_action
+            elif executed_prev in self.spec.actions:
+                action = executed_prev
+            else:
+                action = self.spec.default_action
         self._prev_tokens = ctx
-        self._prev_decided = action
+        self._prev_decided = decided
+        self._prev_ctx = (nov, conf, float(intensity))
         self.decisions += 1
-        return DecisionInfo(action=action, mode=_decision_mode(agent), no_action=no_action)
+        return DecisionInfo(action=action, mode=_decision_mode(agent), no_action=no_action, mood=_mood(agent))
 
     def advance(self, elapsed: float) -> None:
         if elapsed > 0.0:
             self.agent.advance_time(float(elapsed))
 
     # ----- sleep --------------------------------------------------------------------------------
-    def sleep(self, cycles: Optional[int] = None) -> dict:
-        """Consolidate. The previous action is left open: the next decide() after waking closes it."""
-        stats = self.agent.sleep(cycles=int(cycles or self.spec.sleep_cycles), sleep_duration_seconds=0.0)
+    def sleep(self, cycles: Optional[int] = None, duration_s: float = 0.0) -> dict:
+        """Consolidate. The previous action is left open: the next decide() after waking closes it.
+
+        ``duration_s`` is how long the body sleeps in simulation time, so wakefulness recovers.
+        """
+        if self.spec.frozen:
+            self.sleeps += 1
+            return {"frozen": True}               # no consolidation: the control caste never rewrites memory
+        stats = self.agent.sleep(cycles=int(cycles or self.spec.sleep_cycles),
+                                 sleep_duration_seconds=max(0.0, float(duration_s)))
         self.sleeps += 1
         return stats if isinstance(stats, dict) else {}
 
@@ -276,6 +328,7 @@ class NowaBrain:
         return {
             "prev_tokens": self._prev_tokens,
             "prev_decided": self._prev_decided,
+            "prev_ctx": list(self._prev_ctx),
             "decisions": self.decisions,
             "sleeps": self.sleeps,
             "genome": self.genome(),
@@ -298,6 +351,14 @@ class NowaBrain:
             a.epigenome = EpigenomeSnapshot.from_dict(host_state["epigenome"])
         brain._prev_tokens = host_state.get("prev_tokens")
         brain._prev_decided = host_state.get("prev_decided")
+        brain._prev_ctx = tuple(host_state.get("prev_ctx") or (0.0, 0.0, 1.0))
+        # Parts of the core still read the wall clock (wakefulness): forget the time the save spent on disk.
+        try:
+            import time as _time
+
+            a.wakefulness.last_update_ts = _time.time()
+        except Exception:  # noqa: BLE001
+            pass
         brain.decisions = int(host_state.get("decisions", 0))
         brain.sleeps = int(host_state.get("sleeps", 0))
         return brain
@@ -334,6 +395,8 @@ class NowaBrain:
             "neuromodulators": nm,
             "mode": _decision_mode(a),
             "episodes": len(getattr(a.hippocampus, "experiences", []) or []),
+            "lost_unconsolidated": int(getattr(a, "lost_unconsolidated", 0) or 0),
+            "wakefulness": round(float(getattr(getattr(a, "wakefulness", None), "wakefulness", 0.0) or 0.0), 3),
             "decisions": self.decisions,
             "sleeps": self.sleeps,
             "last_tokens": list(self._prev_tokens or []),

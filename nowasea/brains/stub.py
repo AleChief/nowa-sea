@@ -52,7 +52,7 @@ class StubBrain:
     def advance(self, elapsed: float) -> None:
         pass
 
-    def sleep(self, cycles=None) -> dict:
+    def sleep(self, cycles=None, duration_s: float = 0.0) -> dict:
         self.sleeps += 1
         return {}
 
@@ -87,3 +87,34 @@ class StubBrain:
 
     def stable_payload(self) -> dict:
         return {"decisions": self.decisions}
+
+
+class ReflexBrain(StubBrain):
+    """No learning: picks the action the body pushes hardest (the drives passed as ``bias``), else wanders.
+
+    The control group for NOWA: it sees exactly what NOWA's bias input carries, but never learns.
+    """
+
+    def decide(self, tokens, *, executed_prev=None, reward_prev=None, elapsed=0.0, novelty=0.0, conflict=0.0,
+               intensity=1.0, bias=None):
+        self.decisions += 1
+        self._tokens = list(tokens)
+        if bias:
+            best = max(bias.items(), key=lambda kv: kv[1])
+            if best[1] > 0 and best[0] in self.spec.actions:
+                self._last = best[0]
+                return DecisionInfo(action=self._last, mode="reflex")
+        wander = [a for a in ("forage", "scavenge", "patrol", "explore", "school", "drift") if a in self.spec.actions]
+        self._last = self.rng.choice(wander or list(self.spec.actions))
+        return DecisionInfo(action=self._last, mode="reflex")
+
+
+class RandomBrain(StubBrain):
+    """No learning, no drives: a uniformly random action each time (the lower bound)."""
+
+    def decide(self, tokens, *, executed_prev=None, reward_prev=None, elapsed=0.0, novelty=0.0, conflict=0.0,
+               intensity=1.0, bias=None):
+        self.decisions += 1
+        self._tokens = list(tokens)
+        self._last = self.rng.choice(list(self.spec.actions))
+        return DecisionInfo(action=self._last, mode="random")

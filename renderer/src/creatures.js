@@ -3,32 +3,38 @@
 // ============================================================================
 // Binary `state` frames (20 Hz) go into a ring of preallocated snapshots. Every creature id gets a track that lives
 // while the id is in the stream, plus a short fade-out after it leaves (death) and a fade-in when it appears (birth).
-// Each frame the tracks are placed between the two snapshots around (now - DELAY), oriented from their velocity,
+// Each frame the tracks are placed between the two snapshots around (now - snDelay), oriented from their velocity,
 // and packed, grouped by body plan, into one Float32Array that main.js uploads with a single writeBuffer.
 // Nothing here allocates per frame; parsing allocates one DataView per received frame.
-const MAXC = 2048, MAXP = 8192, RING = 4, MAXT = 4096, HSZ = 8192, DELAY = 110;
+const MAXC = 2048, MAXP = 8192, RING = 4, MAXT = 4096, HSZ = 8192;
 const MESHK = { fish: 0, manta: 1, needle: 2, shark: 3, jelly: 4 }, NKIND = 5;
-const CSTR = 20, PSTR = 5; // floats per creature / particle instance
+const CSTR = 24, PSTR = 5; // floats per creature / particle instance
 const snap = [];
 for (let r = 0; r < RING; r++) snap.push({ t: 0, seq: 0, flags: 0, n: 0, m: 0, simTime: 0, speedSet: 0, speedAchieved: 0, dayPhase: 0, light: 1, selected: 0,
   id: new Uint32Array(MAXC), species: new Uint8Array(MAXC), intent: new Uint8Array(MAXC), cflags: new Uint8Array(MAXC), glow: new Uint8Array(MAXC),
   pos: new Float32Array(MAXC * 3), vel: new Float32Array(MAXC * 3), scale: new Float32Array(MAXC), energy: new Float32Array(MAXC),
   ppos: new Float32Array(MAXP * 3), pkind: new Uint8Array(MAXP), psize: new Uint8Array(MAXP) });
-let snHead = 0, snN = 0, snArr = 0, snPer = 50;
+// snPer: measured interval between new frames (ms); snDelay: how far behind the newest frame the creatures are drawn,
+// 1.6 intervals (about 110 ms at 20 Hz, 350 ms in turbo at 5 Hz), so there is nearly always a frame on each side
+let snHead = 0, snN = 0, snArr = 0, snPer = 50, snDelay = 110;
 
 // per species (from hello): body plan, length (m), cruise speed, tail beats per metre swum, bank gain
 const spKind = new Uint8Array(256), spLen = new Float32Array(256).fill(0.5), spCruise = new Float32Array(256).fill(1), spBeat = new Float32Array(256).fill(1), spBank = new Float32Array(256).fill(0.5);
 // per intent index: needlejaw coils into an S (ambush, stalk), sweeper lies flat (burrow)
-const itBend = new Uint8Array(256), itFlat = new Uint8Array(256);
+const itBend = new Uint8Array(256), itFlat = new Uint8Array(256), itHunt = new Uint8Array(256);
+// per species: hunts (has chase / strike), is prey (has flee), glows at night (fish, jelly)
+const spHunt = new Uint8Array(256), spPrey = new Uint8Array(256), spGlowy = new Uint8Array(256);
 function setSpecies(hello) {
   for (const s of hello.species || []) {
     const i = s.index & 255, k = MESHK[s.mesh] ?? 0;
     spKind[i] = k; spLen[i] = s.length || 0.5; spCruise[i] = max(s.cruise || 1, 0.1);
     spBeat[i] = k === 1 ? 0.5 / spLen[i] : k === 4 ? 0.3 : k === 3 ? 0.5 / spLen[i] : 0.8 / spLen[i];
     spBank[i] = k === 3 ? 0.7 : k === 1 ? 0.5 : k === 4 ? 0 : 0.35;
+    const act = s.actions || [];
+    spHunt[i] = act.includes('strike') || act.includes('chase') ? 1 : 0; spPrey[i] = act.includes('flee') ? 1 : 0; spGlowy[i] = k === 4 || k === 0 ? 1 : 0;
   }
-  itBend.fill(0); itFlat.fill(0);
-  (hello.intents || []).forEach((n, i) => { if (n === 'ambush' || n === 'stalk') itBend[i] = 1; if (n === 'burrow') itFlat[i] = 1; });
+  itBend.fill(0); itFlat.fill(0); itHunt.fill(0);
+  (hello.intents || []).forEach((n, i) => { if (n === 'ambush' || n === 'stalk') itBend[i] = 1; if (n === 'burrow') itFlat[i] = 1; if (n === 'chase' || n === 'strike') itHunt[i] = 1; });
 }
 
 // ---------------------------------------------------------------- tracks
@@ -36,6 +42,8 @@ const tkId = new Uint32Array(MAXT), tkSt = new Uint8Array(MAXT), tkRow = new Int
 const tkP = new Float32Array(MAXT * 3), tkV = new Float32Array(MAXT * 3), tkF = new Float32Array(MAXT * 3), tkU = new Float32Array(MAXT * 3), tkFp = new Float32Array(MAXT * 3);
 const tkPh = new Float32Array(MAXT), tkVis = new Float32Array(MAXT), tkGlow = new Float32Array(MAXT), tkBend = new Float32Array(MAXT), tkFlat = new Float32Array(MAXT), tkSeed = new Float32Array(MAXT), tkSz = new Float32Array(MAXT);
 const tkFl = new Uint8Array(MAXT), tkGl = new Uint8Array(MAXT), tkIt = new Uint8Array(MAXT), tkKind = new Uint8Array(MAXT);
+// burst pose: sustained tail amplitude (0..1) and a C-flex impulse at the onset, its side alternating
+const tkBurst = new Float32Array(MAXT), tkFlex = new Float32Array(MAXT), tkFlexS = new Float32Array(MAXT).fill(1), tkWasB = new Uint8Array(MAXT);
 const tkList = new Int32Array(MAXT), tkFree = new Int32Array(MAXT);
 let tkN = 0, tkNF = 0;
 for (let t = MAXT - 1; t >= 0; t--) tkFree[tkNF++] = t;
@@ -48,7 +56,7 @@ function hRebuild() { hV.fill(-1); for (let i = 0; i < tkN; i++) hPut(tkId[tkLis
 function tkAlloc(id, s, i) {
   if (!tkNF) return -1;
   const t = tkFree[--tkNF]; tkList[tkN++] = t; hPut(id, t);
-  tkId[t] = id; tkSt[t] = 1; tkHas[t] = 0; tkVis[t] = 0; tkBend[t] = 0; tkFlat[t] = 0; tkGlow[t] = 0;
+  tkId[t] = id; tkSt[t] = 1; tkHas[t] = 0; tkVis[t] = 0; tkBend[t] = 0; tkFlat[t] = 0; tkGlow[t] = 0; tkBurst[t] = 0; tkFlex[t] = 0; tkWasB[t] = 0;
   for (let r = 0; r < RING; r++) tkRow[t * RING + r] = -1;
   const sp = s.species[i]; tkSp[t] = sp; tkKind[t] = spKind[sp];
   tkSeed[t] = ((Math.imul(id, 2654435761) >>> 0) % 10007) / 10007; tkPh[t] = tkSeed[t] * 7;
@@ -64,14 +72,16 @@ function tkFreeAt(li) { const t = tkList[li]; tkList[li] = tkList[--tkN]; tkFree
 function tracksReset() { while (tkN) tkFreeAt(tkN - 1); hRebuild(); snN = 0; }
 
 // ---------------------------------------------------------------- binary state frame (docs/protocol.md)
+// returns false for a repeated frame: the server resends its latest frame at 20 Hz even when it has made fewer (turbo)
 function onStateFrame(buf) {
   if (hDirty) hRebuild();
   const dv = new DataView(buf), r = snN ? (snHead + 1) % RING : 0, s = snap[r];
+  if (snN && dv.getUint32(4, true) === snap[snHead].seq) return false;
   const n = dv.getUint16(2, true), m = dv.getUint16(32, true), nn = min(n, MAXC), mm = min(m, MAXP);
   s.flags = dv.getUint8(1); s.seq = dv.getUint32(4, true); s.simTime = dv.getFloat64(8, true);
   s.speedSet = dv.getFloat32(16, true); s.speedAchieved = dv.getFloat32(20, true); s.dayPhase = dv.getFloat32(24, true); s.light = dv.getFloat32(28, true);
   s.selected = dv.getUint16(34, true);
-  if (buf.byteLength < 36 + 40 * n + 16 * m) return;
+  if (buf.byteLength < 36 + 40 * n + 16 * m) return false;
   for (let i = 0, o = 36; i < nn; i++, o += 40) {
     s.id[i] = dv.getUint32(o, true); s.species[i] = dv.getUint8(o + 4); s.intent[i] = dv.getUint8(o + 5); s.cflags[i] = dv.getUint8(o + 6); s.glow[i] = dv.getUint8(o + 7);
     s.pos[i * 3] = dv.getFloat32(o + 8, true); s.pos[i * 3 + 1] = dv.getFloat32(o + 12, true); s.pos[i * 3 + 2] = dv.getFloat32(o + 16, true);
@@ -85,8 +95,9 @@ function onStateFrame(buf) {
   s.n = nn; s.m = mm;
   // arrival time on a smoothed clock: snapshots are spaced evenly unless the stream stalls
   const now = performance.now();
-  if (!snN || now - snArr > 400) s.t = now;
-  else { snPer += (min(now - snArr, 200) - snPer) * 0.05; const est = snap[snHead].t + snPer; s.t = est + (now - est) * 0.2; }
+  if (!snN || now - snArr > max(400, snPer * 3)) s.t = now;
+  else { snPer += (min(now - snArr, 1000) - snPer) * 0.1; const est = snap[snHead].t + snPer; s.t = est + (now - est) * 0.2; }
+  snDelay += (clamp(snPer * 1.6 + 25, 90, 800) - snDelay) * 0.1;
   snArr = now; snHead = r; snN++;
   for (let k = 0; k < tkN; k++) tkRow[tkList[k] * RING + r] = -1;
   for (let i = 0; i < nn; i++) {
@@ -95,6 +106,7 @@ function onStateFrame(buf) {
     tkRow[t * RING + r] = i; tkSt[t] = 1;
   }
   for (let k = 0; k < tkN; k++) { const t = tkList[k]; if (tkRow[t * RING + r] < 0) tkSt[t] = 2; }
+  return true;
 }
 
 // ---------------------------------------------------------------- per frame: interpolate, orient, pack
@@ -106,7 +118,7 @@ function updateCreatures(now, dt) {
   if (!snN) return;
   if (hDirty) hRebuild();
   // the two snapshots around the render time
-  const tr = now - DELAY, cnt = min(snN, RING);
+  const tr = now - snDelay, cnt = min(snN, RING);
   let a = -1, b = snHead;
   for (let j = 0, k = snHead; j < cnt - 1; j++) {
     const p = (k + RING - 1) % RING;
@@ -114,7 +126,8 @@ function updateCreatures(now, dt) {
     k = p;
   }
   const sb = snap[b], sa = a >= 0 ? snap[a] : sb;
-  let al = a >= 0 ? (tr - sa.t) / max(sb.t - sa.t, 1) : 1; al = al < 0 ? 0 : al > 1 ? 1 : al;
+  // past the newest frame (a late one): carry on along the last step for at most 35 % of an interval
+  let al = a >= 0 ? (tr - sa.t) / max(sb.t - sa.t, 1) : 1; al = al < 0 ? 0 : al > 1.35 ? 1.35 : al;
   snB = b;
   // sim seconds per wall second: swim animation runs at the speed the creatures are seen to move, frozen on pause
   const ws = sb.speedAchieved > 0 ? sb.speedAchieved : 0, kF = 1 - exp(-dt * 5), kU = 1 - exp(-dt * 4), kG = 1 - exp(-dt * 4), kS = 1 - exp(-dt * 2);
@@ -129,7 +142,8 @@ function updateCreatures(now, dt) {
       }
       tkP[o] = x; tkP[o + 1] = y; tkP[o + 2] = z; tkV[o] = vx; tkV[o + 1] = vy; tkV[o + 2] = vz;
       tkFl[t] = sb.cflags[ib]; tkGl[t] = sb.glow[ib]; tkIt[t] = sb.intent[ib]; tkSz[t] = spLen[tkSp[t]] * (sb.scale[ib] > 0 ? sb.scale[ib] : 1);
-      if (sb.selected && sb.id[ib] === sb.selected) tkFl[t] |= 16;
+      // the highlight follows this client's selection (full id); the server's flag is for its own last selection
+      tkFl[t] = followId && sb.id[ib] === followId ? tkFl[t] | 16 : tkFl[t] & ~16;
       tkHas[t] = 1;
     }
     if (!tkHas[t]) continue; // born after the render time: not shown yet
@@ -178,6 +192,11 @@ function updateCreatures(now, dt) {
     if (fl & 1) gt *= 0.12; if (fl & 2) gt *= 1.8; if (fl & 8) gt *= 0.45; if (flat) gt *= 0.08;
     tkGlow[t] += (gt - tkGlow[t]) * kG;
     tkBend[t] += ((kind === 2 && itBend[tkIt[t]] && !(fl & 2) ? 1 : 0) - tkBend[t]) * kS;
+    const bu = fl & 2 ? 1 : 0;
+    if (bu && !tkWasB[t]) { tkFlex[t] = 1; tkFlexS[t] = -tkFlexS[t]; }
+    tkWasB[t] = bu;
+    tkBurst[t] += (bu - tkBurst[t]) * (1 - exp(-dt * (bu ? 8 : 3)));
+    tkFlex[t] *= exp(-dt * 4.5);
     tkFlat[t] += (flat - tkFlat[t]) * kS;
     if (tkVis[t] > 0.01) kindN[kind]++;
   }
@@ -194,6 +213,7 @@ function updateCreatures(now, dt) {
     CI[j + 8] = tkU[o]; CI[j + 9] = tkU[o + 1]; CI[j + 10] = tkU[o + 2]; CI[j + 11] = tkGlow[t];
     CI[j + 12] = sp; CI[j + 13] = tkFl[t]; CI[j + 14] = tkBend[t]; CI[j + 15] = tkVis[t];
     CI[j + 16] = tkSeed[t]; CI[j + 17] = sqrt(tkV[o] * tkV[o] + tkV[o + 1] * tkV[o + 1] + tkV[o + 2] * tkV[o + 2]) / spCruise[sp]; CI[j + 18] = tkFlat[t]; CI[j + 19] = 0;
+    CI[j + 20] = tkBurst[t]; CI[j + 21] = tkFlex[t] * tkFlexS[t]; CI[j + 22] = 0; CI[j + 23] = 0;
   }
   // particles of the same snapshot: position, radius (size byte is the diameter in cm), kind
   const m = sb.m;
@@ -206,7 +226,7 @@ function updateCreatures(now, dt) {
 }
 
 // creature under screen point (sx, sy) in CSS pixels of a w x h canvas, with view-projection M (column-major);
-// returns its id or 0. A creature with rock between it and the camera is skipped (ray marched in the rock grid).
+// returns its id or 0. A creature with rock or kelp between it and the camera is skipped (ray marched in the rock grid).
 let pickScore = 0;
 function pickCreature(sx, sy, w, h, M, tanh) {
   let after = -1;
@@ -214,7 +234,7 @@ function pickCreature(sx, sy, w, h, M, tanh) {
     const t = pickNext(sx, sy, w, h, M, tanh, after);
     if (t < 0) return 0;
     const o = t * 3;
-    if (!rockBetween(F[DX], F[DY], F[DZ], tkP[o], tkP[o + 1], tkP[o + 2], tkSz[t] * 0.5)) return tkId[t];
+    if (!rockBetween(F[DX], F[DY], F[DZ], tkP[o], tkP[o + 1], tkP[o + 2], tkSz[t] * 0.5 + 0.3, true)) return tkId[t];
     after = pickScore; // hidden: try the next candidate
   }
 }

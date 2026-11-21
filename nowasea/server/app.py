@@ -82,6 +82,10 @@ class Hub:
                                 pass
             if tick % int(STATE_HZ / STATS_HZ) == 0:
                 await self._send_all(json.dumps(self.source.stats()), False)
+            if tick % int(STATE_HZ * 5) == 0:
+                ins = getattr(self.source, "insights", lambda: None)()
+                if ins:
+                    await self._send_all(json.dumps(ins), False)
             if tick % int(STATE_HZ / PLANKTON_HZ) == 0:
                 await self._send_all(self.source.plankton_frame(), True)
 
@@ -115,6 +119,13 @@ def make_app(source, dist: Path | None = None) -> web.Application:
         return web.json_response({"ok": True, "clients": len(hub.clients)})
 
     async def ws_handler(req):
+        # Only the page served by this server may drive the aquarium (load, delete, spawn...).
+        origin = req.headers.get("Origin")
+        if origin:
+            from urllib.parse import urlparse
+
+            if urlparse(origin).netloc != req.host:
+                raise web.HTTPForbidden(text="cross-origin WebSocket refused")
         ws = web.WebSocketResponse(max_msg_size=16 * 1024 * 1024, heartbeat=20)
         await ws.prepare(req)
         hub.clients.add(ws)

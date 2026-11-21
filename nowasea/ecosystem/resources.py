@@ -23,7 +23,7 @@ class Plankton:
         self.depth_light = np.exp(-np.maximum(0.0, -y_mid) / tank.light_depth)[:, None, None]
         rng = rng or np.random.default_rng(0)
         self.rho = np.clip(0.25 + 0.5 * self.depth_light * rng.uniform(0.6, 1.0, (ny, nz, nx)), 0, 1)
-        self.growth = 0.009        # 1/s at full light
+        self.growth = 0.012        # 1/s at full light
         self.seed_rate = 0.0004    # spontaneous appearance in light
         self.nutrient = 0.5        # 0..2 boosts growth; fed by decay
         self._diffuse_t = 0.0

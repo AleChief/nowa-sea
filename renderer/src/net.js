@@ -1,7 +1,8 @@
 // ============================================================================
 // WebSocket link to the server (same origin, /ws): hello -> floor -> world build; state, plankton; commands out
 // ============================================================================
-let ws = null, wsOk = false, helloMsg = null, worldKey = '', wantBuild = null, building = false, queued = null;
+// worldKey: the world on screen; buildKey: the one being built; queued: the next build job (only the latest is kept)
+let ws = null, wsOk = false, helloMsg = null, worldKey = '', buildKey = '', wantBuild = null, building = false, queued = null;
 let plank = null; // last plankton frame: { nx, ny, nz, data }
 const jsonL = [], stateL = [];
 const nowaSpecies = () => (helloMsg ? helloMsg.species : []);
@@ -23,16 +24,22 @@ function connect() {
     }
     if (!(d instanceof ArrayBuffer) || d.byteLength < 8) return;
     const ty = new DataView(d).getUint8(0);
-    if (ty === 1) { onStateFrame(d); const s = snap[snHead]; for (let i = 0; i < stateL.length; i++) { try { stateL[i](s); } catch (er) { console.error(er); } } }
+    if (ty === 1) { if (!onStateFrame(d)) return; const s = snap[snHead]; for (let i = 0; i < stateL.length; i++) { try { stateL[i](s); } catch (er) { console.error(er); } } }
     else if (ty === 2) onPlankton(d);
     else if (ty === 3) onFloor(d);
   };
 }
 function onHello(m) {
   if (helloMsg && helloMsg.world_id !== m.world_id) { tracksReset(); select(0); }
+  // the same world after a reconnect: the server does not know this client's selection any more
+  else if (followId) sendSelect(followId);
   helloMsg = m; setSpecies(m); uploadSpecies(m);
   const key = JSON.stringify(m.tank);
-  wantBuild = key !== worldKey ? key : null; // the floor frame that follows completes it
+  // the world that will be on screen once the builds in flight are done; a hello for it needs no build, and one for
+  // the world being built drops a queued build of another
+  if (queued && key === buildKey) queued = null;
+  const target = queued ? queued.key : building ? buildKey : worldKey;
+  wantBuild = key !== target ? key : null; // the floor frame that follows completes it
 }
 function onFloor(buf) {
   if (!wantBuild || !helloMsg) return;
@@ -44,9 +51,9 @@ function onFloor(buf) {
   runBuild(job);
 }
 function runBuild(job) {
-  building = true;
+  building = true; buildKey = job.key;
   buildWorld(job).then(() => { worldKey = job.key; }, (e) => { console.error(e); dead || ($('s').textContent = 'World build failed: ' + e.message); })
-    .finally(() => { building = false; if (queued) { const q = queued; queued = null; runBuild(q); } });
+    .finally(() => { building = false; buildKey = ''; const q = queued; queued = null; if (q && q.key !== worldKey) runBuild(q); });
 }
 function onPlankton(buf) {
   const dv = new DataView(buf), nx = dv.getUint16(2, true), ny = dv.getUint16(4, true), nz = dv.getUint16(6, true);

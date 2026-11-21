@@ -31,10 +31,12 @@ ARRAYS = ["cid", "sp", "pos", "vel", "energy", "stamina", "age", "lifespan", "ma
           "sleeping", "in_cover", "glow", "target", "target_seen", "target_pos", "threat_vec", "threat_seen",
           "threat_level", "prey_level", "waypoint", "home", "food_dir", "school_c", "school_v", "school_n", "mate",
           "last_decide", "reward", "cooldown", "gen", "children", "speed_g", "vision_g", "metab_g", "brain_ready",
-          "decisions", "strike_cd", "digest"]
+          "decisions", "strike_cd", "digest", "attempts", "catches", "encounters", "escapes", "in_encounter",
+          "reward_sum", "reward_n", "q_counts", "last_threat_d", "last_prey_d"]
 SLOT_REFS = {"target", "mate"}   # slot indices that must be remapped through creature ids
 
 _SLOT_RE = re.compile(r"^[\w\-. ]{1,64}$")
+RESTORE_SLOT = "_before_load"
 
 
 def clean_slot(slot: str) -> str:
@@ -82,6 +84,9 @@ def sim_state(sim) -> dict:
         "config": asdict(sim.cfg),
         "time": sim.time, "steps": sim.steps, "next_id": sim.next_id,
         "births": sim.births, "deaths": sim.deaths, "extinct_since": sim.extinct_since,
+        "deaths_sp": sim.deaths_sp, "births_sp": sim.births_sp, "gen_stats": sim.gen_stats,
+        "lineage": list(sim.lineage.values()),
+        "insights": sim.insights.to_state(alive),
         "history": sim.history, "last_history": sim._last_history, "archive": sim.archive,
         "selected": sim.selected, "tank_seed": sim.tank.seed,
         "plankton": sim.plankton.to_state(), "particles": sim.particles.to_state(),
@@ -97,6 +102,11 @@ def restore_sim(sim, state: dict) -> None:
     sim.next_id = int(state["next_id"])
     sim.births = int(state["births"])
     sim.deaths = dict(state["deaths"])
+    sim.deaths_sp.update({k: dict(v) for k, v in state.get("deaths_sp", {}).items()})
+    sim.births_sp.update(state.get("births_sp", {}))
+    sim.gen_stats.update({k: dict(v) for k, v in state.get("gen_stats", {}).items()})
+    sim.lineage = {int(r["id"]): dict(r) for r in state.get("lineage", [])}
+    sim.insights.load_state(state.get("insights"))
     sim.extinct_since = {k: float(v) for k, v in state["extinct_since"].items()}
     sim.history = state["history"]
     sim._last_history = float(state.get("last_history", sim.time))
@@ -112,7 +122,7 @@ def restore_sim(sim, state: dict) -> None:
     sim.slot_of.clear()
     for slot, rec in enumerate(state["creatures"]):
         for name in ARRAYS:
-            if name in SLOT_REFS:
+            if name in SLOT_REFS or name not in rec:
                 continue
             arr = getattr(sim, name)
             arr[slot] = np.asarray(rec[name], dtype=arr.dtype)
@@ -155,6 +165,43 @@ class SaveStore:
             return True
         return False
 
+    def validate(self, slot: str, brain_kind: Optional[str] = None) -> dict:
+        """Check a slot without touching the running world: format, world.json, every brain file present.
+
+        Raises ValueError with a readable reason. Returns the manifest.
+        """
+        path = self.path(slot)
+        if not path.is_file():
+            raise FileNotFoundError(f"no save {slot!r}")
+        try:
+            with zipfile.ZipFile(path) as z:
+                names = set(z.namelist())
+                manifest = json.loads(z.read("manifest.json"))
+                if manifest.get("format") != FORMAT or int(manifest.get("version", 0)) > VERSION:
+                    raise ValueError("not a NOWA Sea save, or saved by a newer version")
+                if "world.json" not in names:
+                    raise ValueError("world.json is missing")
+                state = json.loads(z.read("world.json"))
+        except zipfile.BadZipFile as exc:
+            raise ValueError(f"damaged file: {exc}") from exc
+        kind = manifest.get("brain_kind", "nowa")
+        if brain_kind and kind != brain_kind:
+            raise ValueError(f"saved with '{kind}' brains, the server runs '{brain_kind}' (start it with --brain {kind})")
+        missing = [int(r["cid"]) for r in state.get("creatures", []) if SPECIES[int(r["sp"])].brain == "nowa"
+                   and (f"brains/{int(r['cid'])}.nowa" not in names or f"brains/{int(r['cid'])}.host.json" not in names)]
+        if missing:
+            raise ValueError(f"{len(missing)} brain file(s) missing, e.g. #{missing[0]}")
+        return manifest
+
+    def quarantine(self, slot: str) -> Optional[Path]:
+        """Move a slot that failed to load out of the way (kept for inspection)."""
+        path = self.path(slot)
+        if not path.is_file():
+            return None
+        dest = path.with_name(f"{path.stem}.broken-{dt.datetime.now():%Y%m%d-%H%M%S}.zip")
+        path.replace(dest)
+        return dest
+
     def save(self, slot: str, sim, pool) -> dict:
         """Pause the caller's loop before calling: brains and world must be a consistent cut."""
         target = self.path(slot)
@@ -162,6 +209,7 @@ class SaveStore:
             tmp = Path(tmp)
             brains_dir = tmp / "brains"
             pool.wait_idle()
+            sim._apply_answers()                 # answers that arrived while waiting belong to this cut
             host_states = pool.save_all(brains_dir)
             state = sim_state(sim)
             manifest = {
@@ -176,6 +224,8 @@ class SaveStore:
                 for cid, hs in host_states.items():
                     z.write(brains_dir / f"{cid}.nowa", f"brains/{cid}.nowa")
                     z.writestr(f"brains/{cid}.host.json", json.dumps(hs, default=_jsonable))
+            if slot == "autosave" and target.is_file():
+                target.replace(target.with_name("autosave.prev.zip"))   # one generation of insurance
             partial.replace(target)
         return {"slot": target.stem, "size": target.stat().st_size, **manifest}
 
@@ -225,15 +275,16 @@ def load_into(sim_factory, pool, store: SaveStore, slot: str):
                 continue
             cid = int(rec["cid"])
             host = json.loads((tmp / "brains" / f"{cid}.host.json").read_text(encoding="utf-8"))
-            pool.load(cid, sim.specs[s.id], str(tmp / "brains" / f"{cid}.nowa"), host,
-                      seed=int(sim.prng.randrange(1 << 30)))
+            frozen = (rec.get("meta") or {}).get("caste") == "frozen"
+            spec = (sim.specs_frozen if frozen else sim.specs)[s.id]
+            pool.load(cid, spec, str(tmp / "brains" / f"{cid}.nowa"), host, seed=int(sim.prng.randrange(1 << 30)))
         pool.poll()
         # Wait until every brain is created before the files go away.
         import time
 
         deadline = time.time() + 600
         want = {int(r["cid"]) for r in state["creatures"] if SPECIES[int(r["sp"])].brain == "nowa"}
-        while not want.issubset(pool.created_genomes.keys()):
+        while not want.issubset(pool.created):
             if pool.errors:
                 raise RuntimeError(pool.errors.pop(0))
             if time.time() > deadline:

@@ -81,13 +81,50 @@ u16 резерв.
 
 - `{"t": "stats", "pop": {"sparkfin": 27, …}, "history": [[t, [n0, n1, …]], …], "births": n,
    "deaths": {"eaten": n, "starvation": n, "old_age": n, "removed": n},
-   "extinct": {"shade": {"since": t, "respawn_in": s}}, "brains": {"workers": 2, "decisions_per_s": …,
-   "p95_ms": …, "queue": …}, "speed": {"set": 10, "achieved": 9.4}, "generation_max": {"sparkfin": 5, …}}` — 1 Гц.
+   "extinct": {"shade": {"since": t, "respawn_in": s}},
+   "brains": {"workers": 2, "brains": n, "pending": n, "p50_ms": …, "p95_ms": …, "sleep_ms_mean": …,
+              "decisions": n, "lag_waits": n},
+   "speed": {"set": 10 | "turbo", "achieved": 9.4}, "generation_max": {"sparkfin": 5, …},
+   "births_species": {"sparkfin": n, …}, "deaths_species": {"sparkfin": {"eaten": n, …}, …},
+   "learning": {"sparkfin": [{"gen": 0, "dead": n, "alive": n, "age_days": 1.4, "reward": 0.03,
+                              "catch": null, "escape": 0.62, "eaten": 0.4, "decisions": n,
+                              "evade": 0.6, "feed": null, "hunt": null}, …], …},
+   "settings": {…}, "plankton": 0.4, "particles": n, "time": s, "day": d,
+   "resumed_from": "autosave" | null, "error": null | "…"}` — 1 Гц.
+  - В `learning` по каждому виду NOWA до 12 последних поколений:
+    - `age_days` — средний возраст смерти;
+    - `reward` — средняя награда на решение;
+    - `catch` — доля удачных бросков;
+    - `escape` — доля пережитых встреч с хищником;
+    - `eaten` — доля съеденных среди умерших;
+    - **качество выбора** — доля решений, где выбор подходил к ситуации:
+      - `evade` — хищник рядом, выбрано бегство, укрытие или зарывание;
+      - `feed` — голод при видимом корме или добыче, выбрано кормовое действие;
+      - `hunt` — добыча рядом, выбраны бросок, погоня или подкрадывание.
+
+      Ориентиры: мозг `reflex` даёт ≈ 1,0, `random` ≈ 0,3.
 - `{"t": "inspect", "id": 17, "species": "shade", "generation": 3, "age_days": 1.2, "energy": 0.6,
-   "stamina": 0.9, "intent": "chase", "mode": "habitual" | "balanced" | "deliberative" | "inhibitory", "tokens": […], "affect": {…}, "neuromodulators": {…},
+   "stamina": 0.9, "intent": "chase", "mode": "habitual" | "balanced" | "deliberative" | "inhibitory",
+   "tokens": […2–3 токена, которые получает мозг…], "senses": […все 8–9 ощущений…], "sleeping": false,
+   "in_cover": false, "decisions": n, "body": {"speed", "vision", "metabolism"}, "pos": [x, y, z],
+   "brain": {"affect": {…8 осей…}, "neuromodulators": {…5…}, "uncertainty": 0.1, "mode": "…", "episodes": n,
+             "decisions": n, "sleeps": n, "lost_unconsolidated": n, "wakefulness": 0.3, "last_tokens": […],
+             "last_action": "…"},
+   "genome": {"genes": {"nm_da_ne_weight": -0.2, …}, "generation": 3, …}, "epigenome_size": n,
    "target": 42, "vision": 24, "fov_deg": 200, "parents": [a, b], "children": n, "lifespan_days": 5.4}` —
-  4 Гц, пока выбран.
-- `{"t": "event", "kind": "catch"|"birth"|"death"|"burst"|"extinct"|"repopulate", "pos": [x, y, z], "species": "…"}`.
+  1 Гц, пока выбран. `brain`, `genome` — только у видов с мозгом NOWA (при `--brain nowa`).
+  - Описание 39 генов (модуль, диапазон, смысл) один раз приходит в `hello.genes`:
+    `[{"key", "module", "min", "max", "default", "description"}]`.
+- `{"t": "lineage", "id": 17, "nodes": [{"id", "species", "gen", "parents": […], "children": […], "born", "died",
+   "cause", "alive"}, …]}` — ответ на команду `lineage`: предки до `up` поколений и потомки до `down`.
+- События:
+  - `{"t": "event", "kind": "catch", "species": "<охотник>", "prey": "<вид жертвы>", "pos": […]}`;
+  - `{"t": "event", "kind": "birth", "species", "id", "pos", "generation"}`;
+  - `{"t": "event", "kind": "death", "cause": "eaten"|"starvation"|"old_age"|"removed", "species", "id", "pos"}`;
+  - `{"t": "event", "kind": "extinct", "species"}`;
+  - `{"t": "event", "kind": "repopulate", "species", "n", "mode": "archive"|"fresh"}`.
+
+  Буфер событий ограничен 200 последними, если никто не подключён.
 - `{"t": "saves", "items": [{"slot": "…", "saved_at": "…", "sim_time": …, "size": …, "creatures": …}]}`.
 - `{"t": "toast", "level": "info"|"error", "text": {"ru": "…", "en": "…"}}`.
 
@@ -105,6 +142,11 @@ u16 резерв.
 | `list_saves` | — |
 | `settings` | `repopulate`: {`enabled`, `delay_s`, `mode`: `"fresh"` \| `"archive"`}, `autosave_s` |
 | `new_world` | `seed` |
+| `lineage` | `id`, `up` (по умолчанию 4), `down` (по умолчанию 3) |
+| `kill_species` | `species` — только для тестов, при `NOWASEA_DEBUG_COMMANDS=1` |
+
+WebSocket принимает команды только со страницы этого же сервера: при чужом заголовке `Origin` соединение
+отклоняется (403). Позиции в `feed` и `spawn` прижимаются к объёму воды, мусорные значения отвергаются.
 
 HTTP: `GET /` — рендер; `GET /api/saves/<slot>.zip` — экспорт сейва; `POST /api/saves/import?slot=<slot>` —
 импорт (тело — zip); `GET /api/health`.

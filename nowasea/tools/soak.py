@@ -54,7 +54,9 @@ def main(argv=None) -> int:
                    "deaths": sum(st["deaths"].values()), "p50_ms": st["brains"].get("p50_ms"),
                    "p95_ms": st["brains"].get("p95_ms"), "lag_waits": st["brains"].get("lag_waits"),
                    "pending": st["brains"].get("pending"), "rss_mb": round(rss, 1), "workers_rss_mb": [round(x, 1) for x in workers_rss],
-                   "gen_max": st["generation_max"]}
+                   "gen_max": st["generation_max"], "deaths_sp": st.get("deaths_species"),
+                   "births_sp": st.get("births_species"), "plankton": st.get("plankton"),
+                   "particles": st.get("particles")}
             samples.append(row)
             print(json.dumps(row), flush=True)
     finally:
@@ -67,6 +69,10 @@ def main(argv=None) -> int:
                "mean_speed": round((src.sim.time - sim_t0) / wall, 2), "rss_start_mb": rss0,
                "rss_end_mb": samples[-1]["rss_mb"] if samples else None,
                "deaths_by_cause": src.sim.deaths, "births": src.sim.births,
+               "deaths_by_species": src.sim.deaths_sp, "births_by_species": src.sim.births_sp,
+               "learning": src.sim.learning_summary(max_gens=50),
+               "pop_mean": {k: round(sum(r["pop"][k] for r in samples) / max(1, len(samples)), 2)
+                            for k in (samples[0]["pop"] if samples else {})},
                "p95_ms_last": samples[-1]["p95_ms"] if samples else None}
     print("SUMMARY " + json.dumps(summary))
     if a.json:

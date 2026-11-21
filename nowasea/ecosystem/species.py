@@ -64,7 +64,7 @@ SPECIES: List[Species] = [
         actions=["forage", "school", "flee", "hide", "rest", "explore", "mate"],
         features=["threat", "food", "cover", "school", "energy", "stamina", "light", "edge", "mate"],
         diet={"plankton": 1.0, "pellet": 1.0}, metabolism=0.0022, breed_energy=0.7, founders=6,
-        breed_cooldown_days=0.12, litter=2,
+        breed_cooldown_days=0.2, litter=1,
         body_content=0.30, mesh="fish", color=(0.55, 0.78, 0.80), glow=(1.0, 0.78, 0.25),
     ),
     Species(
@@ -73,7 +73,7 @@ SPECIES: List[Species] = [
         lifespan_days=4.0, mature_days=1.0, sleep_window=(0.15, 0.45),
         actions=["scavenge", "burrow", "flee", "rest", "explore", "mate"],
         features=["threat", "food", "cover", "energy", "stamina", "light", "edge", "mate"],
-        diet={"detritus": 1.0, "carcass": 1.0, "pellet": 0.6}, metabolism=0.0012, breed_energy=0.8, founders=3,
+        diet={"detritus": 1.0, "carcass": 1.0, "pellet": 0.6}, metabolism=0.0012, breed_energy=0.7, founders=3,
         body_content=0.45, mesh="manta", color=(0.62, 0.52, 0.66), glow=(0.30, 0.95, 0.90), prefers_bottom=True,
     ),
     Species(
@@ -82,7 +82,8 @@ SPECIES: List[Species] = [
         lifespan_days=4.0, mature_days=1.0, sleep_window=(0.20, 0.50),
         actions=["ambush", "stalk", "strike", "flee", "hide", "rest", "patrol", "mate"],
         features=["threat", "prey", "cover", "energy", "stamina", "light", "edge", "mate"],
-        diet={"sparkfin": 1.0}, metabolism=0.0003, burst_cost=0.12, hungry_below=0.65, breed_energy=0.85, founders=3,
+        diet={"sparkfin": 1.0}, metabolism=0.0003, burst_cost=0.12, hungry_below=0.65, breed_energy=0.75, founders=3,
+        litter=2,
         body_content=0.55, mesh="needle", color=(0.12, 0.20, 0.42), glow=(0.95, 0.25, 0.85),
     ),
     Species(
@@ -91,9 +92,9 @@ SPECIES: List[Species] = [
         lifespan_days=5.0, mature_days=1.5, sleep_window=(0.0, 0.12),
         actions=["patrol", "chase", "strike", "rest", "explore", "mate"],
         features=["prey", "energy", "stamina", "light", "edge", "mate"],
-        diet={"needlejaw": 1.0, "sweeper": 0.8, "sparkfin": 0.25}, metabolism=0.00025, burst_cost=0.15,
+        diet={"needlejaw": 1.0, "sweeper": 0.35, "sparkfin": 0.2}, metabolism=0.00025, burst_cost=0.15,
         hungry_below=0.55,
-        breed_energy=0.9, founders=2,
+        breed_energy=0.8, founders=2, litter=2,
         body_content=0.8, mesh="shark", color=(0.22, 0.27, 0.32), glow=(0.35, 0.70, 1.00),
     ),
     Species(

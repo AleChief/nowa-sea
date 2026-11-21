@@ -1,3 +1,4 @@
+import os
 import sys
 import warnings
 from pathlib import Path
@@ -9,6 +10,9 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 warnings.filterwarnings("ignore", category=RuntimeWarning)
+
+# The NOWA core raises if anything writes stable memory while awake (host-contract violation).
+os.environ.setdefault("NOWA_STRICT_LEARNING", "1")
 
 
 def nowa_available() -> bool:
